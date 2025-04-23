@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Solana Wallet Searcher</title>
+    <meta
+      name="description"
+      content="Tool for searching Solana wallet token balances and NFT collections."
+    />
+    <meta property="og:title" content="Solana Wallet Searcher" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://solanawalletsearcher.com" />
+    <meta
+      property="og:image"
+      content="https://solanawalletsearcher.com/image.jpg"
+    />
+    <meta
+      property="og:description"
+      content="Tool for searching Solana wallet token balances and NFT collections."
+    />
+    <link rel="stylesheet" href="css/style.css" />
+
+    <!-- Load Solana web3.js -->
+    <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+
+    <!-- Load Metaplex JS SDK -->
+    <script type="module">
+      import * as metaplexModule from "https://esm.sh/@metaplex-foundation/js@0.20.1";
+      window.metaplex = metaplexModule;
+    </script>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Solana Wallet Searcher</h1>
+
+      <div class="actions-bar">
+        <svg class="settings-icon" viewBox="0 0 24 24">
+          <path
+            d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"
+          ></path>
+        </svg>
+      </div>
+
+      <div class="tabs">
+        <div class="tab active" data-tab="tokens-tab">
+          <svg viewBox="0 0 24 24">
+            <path
+              d="M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22A10,10 0 0,1 2,12A10,10 0 0,1 12,2M12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4M11,17V16H9V14H13V13H10A1,1 0 0,1 9,12V9A1,1 0 0,1 10,8H11V7H13V8H15V10H11V11H14A1,1 0 0,1 15,12V15A1,1 0 0,1 14,16H13V17H11Z"
+            />
+          </svg>
+          Tokens
+        </div>
+        <div class="tab" data-tab="nft-tab">
+          <svg viewBox="0 0 24 24">
+            <path
+              d="M5,3C3.89,3 3,3.89 3,5V19C3,20.11 3.89,21 5,21H19C20.11,21 21,20.11 21,19V5C21,3.89 20.11,3 19,3H5M5,5H19V19H5V5M7,7V9H17V7H7M7,11V13H17V11H7M7,15V17H14V15H7Z"
+            />
+          </svg>
+          NFTs
+        </div>
+      </div>
+
+      <!-- PublicKey Input (Shared between tabs) -->
+      <div class="form-group">
+        <label>Enter Wallet Addresses (one per line)</label>
+        <textarea
+          id="walletAddresses"
+          placeholder="Enter Solana wallet addresses..."
+        ></textarea>
+        <div class="file-upload">
+          <label for="walletFile" class="file-upload-button"
+            >Upload Wallet Addresses</label
+          >
+          <input type="file" id="walletFile" accept=".txt,.csv" />
+          <span id="fileName" class="file-name"></span>
+        </div>
+      </div>
+
+      <!-- Tokens Tab -->
+      <div id="tokens-tab" class="tab-content active">
+        <div class="form-group">
+          <div class="switch-container">
+            <label class="switch">
+              <input type="checkbox" id="showAllTokens" checked />
+              <span class="slider"></span>
+            </label>
+            <span class="switch-label">Show all non-zero token balances</span>
+          </div>
+
+          <div class="switch-container">
+            <label class="switch">
+              <input type="checkbox" id="displaySmallBalances" />
+              <span class="slider"></span>
+            </label>
+            <span class="switch-label">Show small balances (< $0.01)</span>
+          </div>
+
+          <div class="switch-container">
+            <label class="switch">
+              <input type="checkbox" id="groupByWalletTokens" checked />
+              <span class="slider"></span>
+            </label>
+            <span class="switch-label">Group by wallet</span>
+          </div>
+        </div>
+
+        <div class="form-group" id="specificTokensGroup" style="display: none">
+          <label>Enter Specific Token Addresses (one per line)</label>
+          <textarea
+            id="tokenAddresses"
+            placeholder="Enter Solana token mint addresses..."
+          ></textarea>
+        </div>
+
+        <button id="searchTokensBtn">Search Tokens</button>
+
+        <div id="progress-container" class="progress-container">
+          <div class="progress-text">
+            Processing wallets: <span id="progress-text">0/0</span>
+          </div>
+          <div id="progress-bar" class="progress-bar"></div>
+        </div>
+
+        <div id="loader" class="loader"></div>
+
+        <div id="error-message" class="error"></div>
+        <div id="success-message" class="success-message"></div>
+
+        <div id="tokens-result" class="result">
+          <div class="result-header">
+            <h3>Token Search Results:</h3>
+            <button class="download-button" data-type="tokens">
+              Download CSV
+            </button>
+          </div>
+          <div id="tokens-result-container"></div>
+        </div>
+      </div>
+
+      <!-- NFT Tab -->
+      <div id="nft-tab" class="tab-content">
+        <div class="form-group">
+          <div class="switch-container">
+            <label class="switch">
+              <input type="checkbox" id="showAllNFTs" checked />
+              <span class="slider"></span>
+            </label>
+            <span class="switch-label">Show all NFTs</span>
+          </div>
+
+          <div class="switch-container">
+            <label class="switch">
+              <input type="checkbox" id="groupByWalletNFTs" checked />
+              <span class="slider"></span>
+            </label>
+            <span class="switch-label">Group by wallet</span>
+          </div>
+        </div>
+
+        <div class="form-group" id="specificNFTsGroup" style="display: none">
+          <label>Enter Specific NFT Collection Addresses</label>
+          <textarea
+            id="nftCollectionAddresses"
+            placeholder="Enter Solana NFT collection addresses..."
+          ></textarea>
+        </div>
+
+        <button id="searchNFTsBtn">Search NFTs</button>
+
+        <div id="nft-progress-container" class="progress-container">
+          <div class="progress-text">
+            Processing wallets: <span id="nft-progress-text">0/0</span>
+          </div>
+          <div id="nft-progress-bar" class="progress-bar"></div>
+        </div>
+
+        <div id="nft-loader" class="loader"></div>
+
+        <div id="nft-error-message" class="error"></div>
+        <div id="nft-success-message" class="success-message"></div>
+
+        <div id="nfts-result" class="result">
+          <div class="result-header">
+            <h3>NFT Search Results:</h3>
+            <button class="download-button" data-type="nfts">
+              Download CSV
+            </button>
+          </div>
+          <div id="nfts-result-container"></div>
+        </div>
+      </div>
+
+      <div class="footer">
+        <p>A tool for searching Solana wallets for token and NFT holdings.</p>
+      </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal">
+      <div class="modal-content">
+        <span class="close-btn" data-modal="settings-modal">&times;</span>
+        <h2 style="color: var(--primary); margin-bottom: 20px">Settings</h2>
+
+        <div class="form-group">
+          <label for="rpcUrl">Custom RPC URL (Required)</label>
+          <input type="text" id="rpcUrl" placeholder="Enter custom RPC URL" />
+          <p
+            style="
+              font-size: 12px;
+              color: var(--text-secondary);
+              margin-top: 5px;
+            "
+          >
+            A custom RPC URL is required for this application to function
+            properly.
+          </p>
+          <p
+            style="
+              font-size: 12px;
+              color: var(--text-secondary);
+              margin-top: 5px;
+            "
+          >
+            You can get a free RPC URL from services like
+            <a
+              class="link"
+              href="https://www.quicknode.com/"
+              target="_blank"
+              ref="noopener"
+              >QuickNode</a
+            >,
+            <a
+              class="link"
+              href="https://www.alchemy.com/"
+              target="_blank"
+              ref="noopener"
+              >Alchemy</a
+            >, or
+            <a
+              class="link"
+              href="https://www.helius.dev/"
+              target="_blank"
+              ref="noopener"
+              >Helius</a
+            >.
+          </p>
+        </div>
+
+        <button id="saveSettingsBtn">Save Settings</button>
+      </div>
+    </div>
+
+    <!-- RPC Prompt Modal -->
+    <div id="rpc-prompt-modal" class="modal">
+      <div class="modal-content">
+        <h2 style="color: var(--primary); margin-bottom: 20px">
+          Custom RPC Required
+        </h2>
+
+        <p style="margin-bottom: 15px">
+          This application requires a custom RPC endpoint to function properly.
+          The public RPC does not support the necessary methods for querying
+          tokens and NFTs.
+        </p>
+
+        <p style="margin-bottom: 15px">
+          You can get a free RPC URL from services like
+          <a
+            class="link"
+            href="https://www.helius.dev/"
+            target="_blank"
+            ref="noopener"
+            >Helius</a
+          >,
+          <a
+            class="link"
+            href="https://www.quicknode.com/"
+            target="_blank"
+            ref="noopener"
+            >QuickNode</a
+          >, or
+          <a
+            class="link"
+            href="https://www.alchemy.com/solana"
+            target="_blank"
+            ref="noopener"
+            >Alchemy</a
+          >.
+        </p>
+
+        <div class="form-group">
+          <label for="promptRpcUrl">Custom RPC URL (Required)</label>
+          <input
+            type="text"
+            id="promptRpcUrl"
+            placeholder="Enter custom RPC URL"
+            required
+          />
+          <p
+            id="rpc-error"
+            class="error"
+            style="display: none; margin-top: 5px"
+          >
+            Please enter a valid RPC URL
+          </p>
+        </div>
+
+        <button id="saveCustomRPCBtn">Use Custom RPC</button>
+      </div>
+    </div>
+    <script src="javascript/token.js"></script>
+    <script src="javascript/nft.js"></script>
+    <script src="javascript/main.js"></script>
+  </body>
+</html>
