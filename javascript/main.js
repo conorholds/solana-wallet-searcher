@@ -1,1908 +1,805 @@
-// javascript/main.js
-// Handles the main functionality of the Solana Wallet Searcher
+/* Browser-only UI and search lifecycle. No wallet access or transaction signing. */
+const SETTINGS_KEY = "solanaWalletSearcherSettings";
+const WALLETS_KEY = "solanaWalletSearcherWallets";
+const MAX_WALLETS = 1000;
+const MAX_INPUT_BYTES = 2 * 1024 * 1024;
+const PAGE_SIZE = 100;
+const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const TOKEN_PROGRAMS = [
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+];
+const $ = (id) => document.getElementById(id);
+const searches = Object.fromEntries(["tokens", "nfts"].map((kind) => [kind, {
+  results: [], wallets: [], checked: [], failures: new Map(), warnings: new Map(),
+  running: false, hasSearched: false, limit: PAGE_SIZE, updatedAt: null,
+}]));
+let settings = { rpcUrl: "" };
+let importVersion = 0;
+let importing = false;
+let lastImport = null;
+let pendingSearch = false;
+let activeSearch = null;
+let lastRun = null;
+let settingsController = null;
+let settingsReturnFocus = null;
+let toastTimer;
 
-const DEFAULT_RPC_URL = "";
-const RPC_DELAY_MS = 500;
-const DEFAULT_RPC_REQUIRED = true;
-
-let settings = {
-  rpcUrl: DEFAULT_RPC_URL,
-  promptShown: false,
-};
-
-let tokenResults = [];
-let nftResults = [];
-let walletAddresses = [];
-let isProcessing = false;
-let tokenMetadataCache = {}; // Cache for token metadata
-
-document.addEventListener("DOMContentLoaded", function () {
-  loadSettings();
-
-  BigInt.prototype.toJSON = function () {
-    return this.toString();
-  };
-
-  document
-    .getElementById("showAllTokens")
-    .addEventListener("change", function () {
-      document.getElementById("specificTokensGroup").style.display = this
-        .checked
-        ? "none"
-        : "block";
-    });
-
-  document
-    .getElementById("showAllNFTs")
-    .addEventListener("change", function () {
-      document.getElementById("specificNFTsGroup").style.display = this.checked
-        ? "none"
-        : "block";
-    });
-
-  setupEventHandlers();
-});
-
-// Set up event handlers
-function setupEventHandlers() {
-  // Tab switching
-  document.querySelectorAll(".tab").forEach((tab) => {
-    tab.addEventListener("click", function () {
-      const tabId = this.getAttribute("data-tab");
-      switchTab(tabId);
-    });
-  });
-
-  // File upload
-  document
-    .getElementById("walletFile")
-    .addEventListener("change", handleFileUpload);
-
-  // Settings modal
-  document
-    .querySelector(".settings-icon")
-    .addEventListener("click", openSettingsModal);
-
-  // Close modals
-  document.querySelectorAll(".close-btn").forEach((btn) => {
-    btn.addEventListener("click", function () {
-      const modalId = this.getAttribute("data-modal");
-      closeModal(modalId);
-    });
-  });
-
-  // Save settings
-  document
-    .getElementById("saveSettingsBtn")
-    .addEventListener("click", saveSettings);
-
-  // RPC modal buttons
-  document
-    .getElementById("saveCustomRPCBtn")
-    .addEventListener("click", saveCustomRPC);
-
-  // Add input validation event listener
-  document
-    .getElementById("promptRpcUrl")
-    .addEventListener("input", function () {
-      // Hide error message when user starts typing
-      document.getElementById("rpc-error").style.display = "none";
-    });
-
-  // Search buttons
-  document
-    .getElementById("searchTokensBtn")
-    .addEventListener("click", () => searchTokens());
-  document
-    .getElementById("searchNFTsBtn")
-    .addEventListener("click", () => searchNFTs());
-
-  // Download CSV buttons
-  document.querySelectorAll(".download-button").forEach((btn) => {
-    btn.addEventListener("click", function () {
-      const type = this.getAttribute("data-type");
-      downloadCSV(type);
-    });
-  });
-
-  // Set up modal outside click handler
-  document.querySelectorAll(".modal").forEach((modal) => {
-    modal.addEventListener("click", function (event) {
-      if (event.target === this) {
-        this.style.display = "none";
-      }
-    });
-  });
+function uniqueAddresses(text) {
+  return [...new Set(text.split(/\r?\n|\r/).map((line) => line.trim()).filter(Boolean))];
 }
 
-// Switch between tabs
-function switchTab(tabId) {
-  // Hide all tab contents
-  document.querySelectorAll(".tab-content").forEach((content) => {
-    content.classList.remove("active");
-  });
-
-  // Deactivate all tabs
-  document.querySelectorAll(".tab").forEach((tab) => {
-    tab.classList.remove("active");
-  });
-
-  // Activate selected tab
-  document.getElementById(tabId).classList.add("active");
-
-  // Find and activate the tab button
-  document.querySelector(`.tab[data-tab="${tabId}"]`).classList.add("active");
-
-  // Hide results
-  document.querySelectorAll(".result").forEach((result) => {
-    result.style.display = "none";
-  });
-
-  // Hide errors
-  document.querySelectorAll(".error").forEach((error) => {
-    error.style.display = "none";
-  });
-
-  // Hide success messages
-  document.querySelectorAll(".success-message").forEach((success) => {
-    success.style.display = "none";
-  });
-}
-
-// Handle file upload
-function handleFileUpload() {
-  const fileInput = document.getElementById("walletFile");
-  const fileName = document.getElementById("fileName");
-
-  if (fileInput.files.length > 0) {
-    const file = fileInput.files[0];
-    fileName.textContent = `${file.name} (processing...)`;
-
-    const reader = new FileReader();
-    reader.onload = function (e) {
-      const contents = e.target.result;
-      const addresses = contents
-        .split(/[\r\n]+/)
-        .filter((address) => address.trim() !== "");
-
-      fileName.textContent = `${file.name} (${addresses.length} addresses)`;
-    };
-
-    reader.readAsText(file);
-  } else {
-    fileName.textContent = "";
+// Parse CSV records, including quoted commas, newlines, and escaped quotes.
+function parseCSV(text) {
+  if (text.length > MAX_INPUT_BYTES) throw new Error("The file is too large. Import a file smaller than 2 MB.");
+  const rows = [];
+  let row = [], field = "", quoted = false, closed = false;
+  text = text.replace(/^\uFEFF/, "");
+  const finishField = () => { row.push(field.trim()); field = ""; closed = false; };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (c === '"') { quoted = false; closed = true; }
+      else field += c;
+    } else if (c === '"') {
+      if (field.trim() || closed) throw new Error("The CSV has a misplaced quote. Check the file and try again.");
+      field = ""; quoted = true;
+    } else if (c === ",") finishField();
+    else if (c === "\n" || c === "\r") {
+      finishField(); if (row.some(Boolean)) rows.push(row); row = [];
+      if (c === "\r" && text[i + 1] === "\n") i++;
+    } else if (closed && c.trim()) throw new Error("The CSV has text after a closing quote.");
+    else if (!closed) field += c;
   }
+  if (quoted) throw new Error("The CSV has an unclosed quote. Check the file and try again.");
+  finishField(); if (row.some(Boolean)) rows.push(row);
+  return rows;
 }
 
-// Get wallet addresses from input or file
+function parseWalletFile(text, filename) {
+  if (!filename.toLowerCase().endsWith(".csv")) return uniqueAddresses(text.replace(/^\uFEFF/, ""));
+  const rows = parseCSV(text);
+  if (!rows.length) return [];
+  const columns = rows[0].map((cell, index) => /^(wallet(address)?|address|publickey)$/.test(cell.toLowerCase().replace(/[\s_-]/g, "")) ? index : -1).filter(index => index >= 0);
+  if (columns.length > 1) throw new Error("The CSV has multiple wallet address columns. Keep one address column.");
+  const column = columns[0] ?? -1;
+  if (column < 0 && rows.some((row) => row.length > 1)) {
+    throw new Error('Add a “Wallet Address” column heading, or use a CSV with one address per row.');
+  }
+  const records = column >= 0 ? rows.slice(1) : rows;
+  if (records.some(row => !row[column < 0 ? 0 : column])) throw new Error("A CSV row has no wallet address. Fill it in or remove the row.");
+  return [...new Set(records.map(row => row[column < 0 ? 0 : column]))];
+}
+
 function getWalletAddresses() {
-  // From textarea
-  const addressesTextarea = document.getElementById("walletAddresses");
-  let addresses = addressesTextarea.value
-    .split(/[\r\n]+/)
-    .filter((address) => address.trim() !== "");
-
-  // From file
-  const fileInput = document.getElementById("walletFile");
-  if (fileInput.files.length > 0) {
-    const reader = new FileReader();
-
-    return new Promise((resolve, reject) => {
-      reader.onload = function (e) {
-        const contents = e.target.result;
-        const fileAddresses = contents
-          .split(/[\r\n]+/)
-          .filter((address) => address.trim() !== "");
-
-        // Combine with textarea addresses
-        const allAddresses = [...addresses, ...fileAddresses];
-
-        // Remove duplicates
-        const uniqueAddresses = [...new Set(allAddresses)];
-        resolve(uniqueAddresses);
-      };
-
-      reader.onerror = function () {
-        reject(new Error("Failed to read file"));
-      };
-
-      reader.readAsText(fileInput.files[0]);
-    });
-  } else {
-    return Promise.resolve(addresses);
-  }
+  return uniqueAddresses($("walletAddresses").value);
 }
 
-// Replace the displayTokenResults function in main.js with this version
-function displayTokenResults() {
-  const container = document.getElementById("tokens-result-container");
-  const groupByWallet = document.getElementById("groupByWalletTokens").checked;
-
-  if (!window.tokenResults || window.tokenResults.length === 0) {
-    console.warn("No tokens found to display");
-    container.innerHTML = "<p>No tokens found.</p>";
-    document.getElementById("tokens-result").style.display = "block";
-    return;
-  }
-
-  container.innerHTML = "";
-
-  if (groupByWallet) {
-    // Group results by wallet
-    const walletGroups = {};
-
-    window.tokenResults.forEach((result) => {
-      if (!walletGroups[result.walletAddress]) {
-        walletGroups[result.walletAddress] = [];
-      }
-      walletGroups[result.walletAddress].push(result);
-    });
-
-    // Get wallet total values
-    const walletTotalValues = window.walletTotalValues || {};
-
-    // Create a section for each wallet - now sorted by total value
-    const sortedWalletAddresses = Object.keys(walletGroups).sort((a, b) => {
-      const valueA = walletTotalValues[a] || 0;
-      const valueB = walletTotalValues[b] || 0;
-      return valueB - valueA;
-    });
-
-    for (const walletAddress of sortedWalletAddresses) {
-      const results = walletGroups[walletAddress];
-      const hasError = results.some((r) => r.error);
-
-      // Create wallet section
-      const walletSection = document.createElement("div");
-      walletSection.className = "wallet-group";
-
-      // Create wallet header
-      const walletHeader = document.createElement("div");
-      walletHeader.className = "wallet-header";
-
-      // Count tokens
-      const tokenCount = hasError ? 0 : results.length;
-
-      // Get total wallet value
-      const totalWalletValue = walletTotalValues[walletAddress] || 0;
-      const totalValueDisplay =
-        totalWalletValue > 0 ? ` (~$${totalWalletValue.toFixed(2)})` : "";
-
-      walletHeader.innerHTML = `
-        <div class="wallet-address" title="${walletAddress}">${walletAddress}</div>
-        <div class="wallet-count">${tokenCount} token${
-        tokenCount !== 1 ? "s" : ""
-      }${totalValueDisplay}</div>
-      `;
-
-      walletSection.appendChild(walletHeader);
-
-      if (hasError) {
-        // Display error message
-        const errorResult = results.find((r) => r.error);
-        const errorMessage = document.createElement("div");
-        errorMessage.style.padding = "12px";
-        errorMessage.style.color = "var(--error)";
-        errorMessage.textContent = `Error: ${errorResult.error}`;
-        walletSection.appendChild(errorMessage);
-      } else {
-        // Create token table
-        const table = document.createElement("table");
-        table.className = "results-table";
-
-        // Create header
-        const headerRow = document.createElement("tr");
-        headerRow.innerHTML = `
-          <th>Symbol</th>
-          <th>Token Name</th>
-          <th>Token Address</th>
-          <th>Balance</th>
-          <th>USDC Value</th>
-          <th>Actions</th>
-        `;
-        table.appendChild(headerRow);
-
-        // Create rows for each token
-        results.forEach((result) => {
-          const row = createTokenTableRow(result);
-          table.appendChild(row);
-        });
-
-        walletSection.appendChild(table);
-      }
-
-      container.appendChild(walletSection);
-    }
-  } else {
-    // Create single table with all results
-    const table = document.createElement("table");
-    table.className = "results-table";
-
-    // Create header
-    const headerRow = document.createElement("tr");
-    headerRow.innerHTML = `
-      <th>Wallet Address</th>
-      <th>Symbol</th>
-      <th>Token Name</th>
-      <th>Token Address</th>
-      <th>Balance</th>
-      <th>USDC Value</th>
-      <th>Actions</th>
-    `;
-    table.appendChild(headerRow);
-
-    // Create rows
-    window.tokenResults.forEach((result) => {
-      const row = document.createElement("tr");
-
-      if (result.error) {
-        // Error result
-        row.innerHTML = `
-          <td>${abbreviateAddress(result.walletAddress)}</td>
-          <td colspan="6" style="color: var(--error)">Error: ${
-            result.error
-          }</td>
-        `;
-      } else {
-        // Format the balance with decimals
-        const formattedBalance = formatTokenBalance(
-          result.balance,
-          result.decimals
-        );
-
-        // Format USDC value
-        const formattedValue =
-          result.usdcValue !== null ? `$${result.usdcValue.toFixed(2)}` : "N/A";
-
-        // Abbreviated addresses
-        const abbreviatedWallet = abbreviateAddress(result.walletAddress);
-        const abbreviatedToken = abbreviateAddress(result.tokenAddress);
-
-        // Highlight SOL row
-        if (result.isNativeSol) {
-          row.classList.add("sol-row");
-        }
-
-        // Normal result
-        row.innerHTML = `
-          <td>${abbreviatedWallet}</td>
-          <td>${result.symbol || "Unknown"}</td>
-          <td>${result.tokenName || "Unknown"}</td>
-          <td>${abbreviatedToken}</td>
-          <td>${formattedBalance}</td>
-          <td>${formattedValue}</td>
-          <td class="actions-cell"></td>
-        `;
-
-        // Add action buttons
-        const actionsCell = row.querySelector(".actions-cell");
-
-        // Copy button
-        const copyBtn = document.createElement("button");
-        copyBtn.className = "icon-button";
-        copyBtn.title = "Copy token address";
-        copyBtn.innerHTML =
-          '<svg viewBox="0 0 24 24"><path d="M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z"/></svg>';
-        copyBtn.addEventListener("click", () =>
-          copyToClipboard(result.tokenAddress)
-        );
-        actionsCell.appendChild(copyBtn);
-
-        // View on Solscan button
-        const viewBtn = document.createElement("button");
-        viewBtn.className = "icon-button";
-        viewBtn.title = "View on Solscan";
-        viewBtn.innerHTML =
-          '<svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>';
-        viewBtn.addEventListener("click", () =>
-          viewTokenOnSolscan(result.walletAddress, result.tokenAddress)
-        );
-        actionsCell.appendChild(viewBtn);
-      }
-
-      table.appendChild(row);
-    });
-
-    container.appendChild(table);
-  }
-
-  // Add some styling for the SOL row
-  const style = document.createElement("style");
-  style.textContent = `
-    .sol-row {
-      background-color: rgba(20, 130, 255, 0.1);
-      font-weight: bold;
-    }
-  `;
-  document.head.appendChild(style);
-  document.getElementById("tokens-result").style.display = "block";
+function readRememberedWallets(raw) {
+  if (raw && raw.length > MAX_INPUT_BYTES) throw new Error("Invalid saved wallets");
+  const saved = JSON.parse(raw || "null");
+  if (!saved) return null;
+  if (saved.remember !== true || !Array.isArray(saved.wallets) || saved.wallets.length > MAX_WALLETS || !saved.wallets.every(address => typeof address === "string" && address.length <= 100)) throw new Error("Invalid saved wallets");
+  return uniqueAddresses(saved.wallets.join("\n"));
 }
 
-// Helper to create token table row
-function createTokenTableRow(result) {
-  const row = document.createElement("tr");
-
-  // Format the balance with decimals
-  const formattedBalance = formatTokenBalance(result.balance, result.decimals);
-
-  // Format USDC value
-  const formattedValue =
-    result.usdcValue !== null ? `$${result.usdcValue.toFixed(2)}` : "N/A";
-
-  // Abbreviated token address
-  const abbreviatedToken = abbreviateAddress(result.tokenAddress);
-
-  // Highlight SOL row
-  if (result.isNativeSol) {
-    row.classList.add("sol-row");
-  }
-
-  // Set the basic row content
-  row.innerHTML = `
-    <td>${result.symbol || "Unknown"}</td>
-    <td>${result.tokenName || "Unknown"}</td>
-    <td>${abbreviatedToken}</td>
-    <td>${formattedBalance}</td>
-    <td>${formattedValue}</td>
-    <td class="actions-cell"></td>
-  `;
-
-  // Add action buttons
-  const actionsCell = row.querySelector(".actions-cell");
-
-  // Copy button
-  const copyBtn = document.createElement("button");
-  copyBtn.className = "icon-button";
-  copyBtn.title = "Copy token address";
-  copyBtn.innerHTML =
-    '<svg viewBox="0 0 24 24"><path d="M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z"/></svg>';
-  copyBtn.addEventListener("click", () => copyToClipboard(result.tokenAddress));
-  actionsCell.appendChild(copyBtn);
-
-  // View on Solscan button
-  const viewBtn = document.createElement("button");
-  viewBtn.className = "icon-button";
-  viewBtn.title = "View on Solscan";
-  viewBtn.innerHTML =
-    '<svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>';
-  viewBtn.addEventListener("click", () =>
-    viewTokenOnSolscan(result.walletAddress, result.tokenAddress)
-  );
-  actionsCell.appendChild(viewBtn);
-
-  return row;
-}
-
-// Similar helper for NFT row creation
-function createNFTTableRow(result, includeWallet = false) {
-  const row = document.createElement("tr");
-
-  // Abbreviated addresses
-  const abbreviatedNFT = abbreviateAddress(result.nftAddress);
-  const abbreviatedCollection = result.collectionAddress
-    ? abbreviateAddress(result.collectionAddress)
-    : "N/A";
-
-  // Base HTML structure
-  let rowHTML = "";
-
-  // Include wallet column if needed
-  if (includeWallet) {
-    const abbreviatedWallet = abbreviateAddress(result.walletAddress);
-    rowHTML += `<td>${abbreviatedWallet}</td>`;
-  }
-
-  // Add the rest of the columns
-  rowHTML += `
-    <td>${abbreviatedCollection}</td>
-    <td>${result.collectionName || "Unknown"}</td>
-    <td>${result.nftName || "Unknown"}</td>
-    <td>${abbreviatedNFT}</td>
-    <td class="actions-cell"></td>
-  `;
-
-  row.innerHTML = rowHTML;
-
-  // Add action buttons
-  const actionsCell = row.querySelector(".actions-cell");
-
-  // Copy button
-  const copyBtn = document.createElement("button");
-  copyBtn.className = "icon-button";
-  copyBtn.title = "Copy NFT address";
-  copyBtn.innerHTML =
-    '<svg viewBox="0 0 24 24"><path d="M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z"/></svg>';
-  copyBtn.addEventListener("click", () => copyToClipboard(result.nftAddress));
-  actionsCell.appendChild(copyBtn);
-
-  // View on Solscan button
-  const nftSolscanLink = `https://solscan.io/token/${result.nftAddress}`;
-  const viewBtn = document.createElement("button");
-  viewBtn.className = "icon-button";
-  viewBtn.title = "View on Solscan";
-  viewBtn.innerHTML =
-    '<svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>';
-  viewBtn.addEventListener("click", () =>
-    window.open(nftSolscanLink, "_blank")
-  );
-  actionsCell.appendChild(viewBtn);
-
-  return row;
-}
-
-// Display NFT results
-function displayNFTResults() {
-  const container = document.getElementById("nfts-result-container");
-  const groupByWallet = document.getElementById("groupByWalletNFTs").checked;
-
-  if (!window.nftResults || window.nftResults.length === 0) {
-    console.warn("No NFTs to display");
-    container.innerHTML = "<p>No NFTs found.</p>";
-    document.getElementById("nfts-result").style.display = "block";
-    return;
-  }
-
-  container.innerHTML = "";
-
-  if (groupByWallet) {
-    // Group results by wallet
-    const walletGroups = {};
-
-    window.nftResults.forEach((result) => {
-      if (!walletGroups[result.walletAddress]) {
-        walletGroups[result.walletAddress] = [];
-      }
-      walletGroups[result.walletAddress].push(result);
-    });
-
-    // Get wallet NFT counts
-    const walletNftCounts = window.walletNftCounts || {};
-
-    // Create a section for each wallet - sorted by NFT count
-    const sortedWalletAddresses = Object.keys(walletGroups).sort((a, b) => {
-      const countA = walletNftCounts[a] || 0;
-      const countB = walletNftCounts[b] || 0;
-      return countB - countA; // Sort by descending NFT count
-    });
-
-    for (const walletAddress of sortedWalletAddresses) {
-      const results = walletGroups[walletAddress];
-      const hasError = results.some((r) => r.error);
-
-      // Create wallet section
-      const walletSection = document.createElement("div");
-      walletSection.className = "wallet-group";
-
-      // Create wallet header
-      const walletHeader = document.createElement("div");
-      walletHeader.className = "wallet-header";
-
-      // Count NFTs
-      const nftCount = hasError ? 0 : results.length;
-
-      walletHeader.innerHTML = `
-        <div class="wallet-address" title="${walletAddress}">${walletAddress}</div>
-        <div class="wallet-count">${nftCount} NFT${
-        nftCount !== 1 ? "s" : ""
-      }</div>
-      `;
-
-      walletSection.appendChild(walletHeader);
-
-      if (hasError) {
-        // Display error message
-        const errorResult = results.find((r) => r.error);
-        const errorMessage = document.createElement("div");
-        errorMessage.style.padding = "12px";
-        errorMessage.style.color = "var(--error)";
-        errorMessage.textContent = `Error: ${errorResult.error}`;
-        walletSection.appendChild(errorMessage);
-      } else {
-        // Create NFT table
-        const table = document.createElement("table");
-        table.className = "results-table";
-
-        // Create header
-        const headerRow = document.createElement("tr");
-        headerRow.innerHTML = `
-          <th>Collection Address</th>
-          <th>Collection Name</th>
-          <th>NFT Name</th>
-          <th>NFT Address</th>
-          <th>Actions</th>
-        `;
-        table.appendChild(headerRow);
-
-        // Create rows
-        results.forEach((result) => {
-          const row = createNFTTableRow(result, false);
-          table.appendChild(row);
-        });
-
-        walletSection.appendChild(table);
-      }
-
-      container.appendChild(walletSection);
-    }
-  } else {
-    // Create single table with all results
-    const table = document.createElement("table");
-    table.className = "results-table";
-
-    // Create header
-    const headerRow = document.createElement("tr");
-    headerRow.innerHTML = `
-      <th>Wallet Address</th>
-      <th>Collection Address</th>
-      <th>Collection Name</th>
-      <th>NFT Name</th>
-      <th>NFT Address</th>
-      <th>Actions</th>
-    `;
-    table.appendChild(headerRow);
-
-    // Create rows
-    window.nftResults.forEach((result) => {
-      if (result.error) {
-        // Error result
-        const row = document.createElement("tr");
-        row.innerHTML = `
-          <td>${abbreviateAddress(result.walletAddress)}</td>
-          <td colspan="5" style="color: var(--error)">Error: ${
-            result.error
-          }</td>
-        `;
-        table.appendChild(row);
-      } else {
-        // Normal result
-        const row = createNFTTableRow(result, true);
-        table.appendChild(row);
-      }
-    });
-
-    container.appendChild(table);
-  }
-
-  document.getElementById("nfts-result").style.display = "block";
-}
-
-// Format token balance with correct decimals
-function formatTokenBalance(balance, decimals) {
-  if (!balance || balance === "0") {
-    return "0";
-  }
-
-  // Ensure decimals is a number
-  const tokenDecimals = parseInt(decimals || 9, 10);
-
+function loadRememberedWallets() {
   try {
-    // Convert string balance to BigInt if needed
-    const balanceBigInt =
-      typeof balance === "string"
-        ? BigInt(balance)
-        : BigInt(balance.toString());
-
-    // Convert to string and pad with leading zeros if needed
-    let balanceStr = balanceBigInt.toString();
-    while (balanceStr.length <= tokenDecimals) {
-      balanceStr = "0" + balanceStr;
-    }
-
-    // Split into integer and fractional parts
-    const integerPart =
-      balanceStr.slice(0, balanceStr.length - tokenDecimals) || "0";
-    const fractionalPart = balanceStr.slice(balanceStr.length - tokenDecimals);
-
-    // Format with commas for thousands separators
-    const integerFormatted = parseInt(integerPart).toLocaleString("en-US");
-
-    // Only show fractional part if non-zero
-    if (parseInt(fractionalPart) === 0) {
-      return integerFormatted;
-    }
-
-    // Trim trailing zeros from fractional part
-    let trimmedFractional = fractionalPart;
-    while (trimmedFractional.endsWith("0")) {
-      trimmedFractional = trimmedFractional.slice(0, -1);
-    }
-
-    if (trimmedFractional.length === 0) {
-      return integerFormatted;
-    }
-
-    return `${integerFormatted}.${trimmedFractional}`;
-  } catch (error) {
-    console.error(
-      "Error formatting balance:",
-      error,
-      "for balance:",
-      balance,
-      "with decimals:",
-      decimals
-    );
-    return balance.toString();
+    const wallets = readRememberedWallets(localStorage.getItem(WALLETS_KEY));
+    $("rememberWallets").checked = wallets !== null;
+    if (wallets && !$("walletAddresses").value.trim()) $("walletAddresses").value = wallets.join("\n");
+  } catch {
+    $("rememberWallets").checked = false;
+    toast("Couldn’t restore saved wallets. Paste or import them again.");
   }
 }
 
-// Create and download a file
-function downloadFile(content, filename) {
-  const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
-  const link = document.createElement("a");
-
-  if (navigator.msSaveBlob) {
-    // IE 10+
-    navigator.msSaveBlob(blob, filename);
-  } else {
-    const url = URL.createObjectURL(blob);
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    setTimeout(() => {
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    }, 100);
-  }
-}
-
-// Helper function to abbreviate addresses (first 6...last 6 chars)
-function abbreviateAddress(address) {
-  if (!address || address.length < 14) return address;
-  return `${address.substring(0, 6)}...${address.substring(
-    address.length - 6
-  )}`;
-}
-
-// Copy text to clipboard
-function copyToClipboard(text) {
-  const textArea = document.createElement("textarea");
-  textArea.value = text;
-  document.body.appendChild(textArea);
-  textArea.select();
-
+function saveRememberedWallets(wallets, optIn = false) {
+  if (!$("rememberWallets").checked) return false;
   try {
-    const successful = document.execCommand("copy");
-    const msg = successful ? "Copied!" : "Failed to copy";
-  } catch (err) {
-    console.error("Copy failed:", err);
-  }
-
-  document.body.removeChild(textArea);
-}
-
-// Open settings modal
-function openSettingsModal() {
-  // Load current settings
-  document.getElementById("rpcUrl").value =
-    settings.rpcUrl === DEFAULT_RPC_URL ? "" : settings.rpcUrl;
-
-  // Show modal
-  document.getElementById("settings-modal").style.display = "block";
-}
-
-// Show RPC prompt modal
-function showRPCPrompt() {
-  const rpcModal = document.getElementById("rpc-prompt-modal");
-  rpcModal.style.display = "block";
-
-  // Remove the close button and disable clicking outside to close
-  const closeBtn = rpcModal.querySelector(".close-btn");
-  if (closeBtn) {
-    closeBtn.style.display = "none";
-  }
-
-  // Prevent closing by clicking outside
-  rpcModal.removeEventListener("click", closeModalOnOutsideClick);
-
-  // Function to prevent closing when clicking outside
-  function closeModalOnOutsideClick(event) {
-    // This function is now empty - modal can't be closed by clicking outside
-  }
-
-  // Replace the existing event listener
-  rpcModal.addEventListener("click", closeModalOnOutsideClick);
-}
-
-// Save settings
-async function saveSettings() {
-  const rpcUrlInput = document.getElementById("rpcUrl").value.trim();
-
-  if (
-    DEFAULT_RPC_REQUIRED &&
-    (!rpcUrlInput || rpcUrlInput === DEFAULT_RPC_URL)
-  ) {
-    alert(
-      "A custom RPC URL is required for this application to function properly."
-    );
-    return;
-  }
-
-  // Show validation message
-  const saveButton = document.getElementById("saveSettingsBtn");
-  const originalText = saveButton.textContent;
-  saveButton.disabled = true;
-  saveButton.textContent = "Validating...";
-
-  try {
-    // Validate the RPC URL
-    const isValid = await validateRpcUrl(rpcUrlInput);
-
-    if (!isValid) {
-      alert(
-        "Invalid RPC URL or connection failed. Please enter a valid RPC URL."
-      );
-      saveButton.disabled = false;
-      saveButton.textContent = originalText;
-      return;
-    }
-
-    settings.rpcUrl = rpcUrlInput;
-    settings.promptShown = true;
-
-    // Save to localStorage
-    localStorage.setItem(
-      "solanaWalletSearcherSettings",
-      JSON.stringify(settings)
-    );
-
-    // Close modal
-    closeModal("settings-modal");
-
-    // Show success message
-    alert("Settings saved successfully!");
-  } catch (error) {
-    console.error("Error validating RPC URL:", error);
-    alert("Error validating RPC URL: " + (error.message || "Unknown error"));
-  } finally {
-    saveButton.disabled = false;
-    saveButton.textContent = originalText;
-  }
-}
-
-// Save custom RPC from prompt
-async function saveCustomRPC() {
-  const rpcUrlInput = document.getElementById("promptRpcUrl").value.trim();
-  const rpcError = document.getElementById("rpc-error");
-  const saveButton = document.getElementById("saveCustomRPCBtn");
-
-  if (rpcUrlInput === "") {
-    rpcError.textContent = "Please enter a valid RPC URL";
-    rpcError.style.display = "block";
-    return; // Don't proceed without a valid RPC URL
-  }
-
-  // Show loading state
-  saveButton.disabled = true;
-  saveButton.textContent = "Validating...";
-
-  try {
-    // Validate the RPC URL
-    const isValid = await validateRpcUrl(rpcUrlInput);
-
-    if (!isValid) {
-      rpcError.textContent = "Invalid RPC URL or connection failed";
-      rpcError.style.display = "block";
-      saveButton.disabled = false;
-      saveButton.textContent = "Use Custom RPC";
-      return;
-    }
-
-    // Hide error if it was shown
-    rpcError.style.display = "none";
-
-    // Update settings
-    settings.rpcUrl = rpcUrlInput;
-    settings.promptShown = true;
-
-    // Save to localStorage
-    localStorage.setItem(
-      "solanaWalletSearcherSettings",
-      JSON.stringify(settings)
-    );
-
-    // Close modal
-    closeModal("rpc-prompt-modal");
-
-    // Store which tab was active when the RPC prompt was shown
-    const activeTab = document.querySelector(".tab.active");
-    const activeTabId = activeTab ? activeTab.getAttribute("data-tab") : null;
-
-    // Restart the search based on the active tab
-    if (activeTabId === "tokens-tab") {
-      setTimeout(() => searchTokens(), 100); // Small delay to ensure UI updates first
-    } else if (activeTabId === "nft-tab") {
-      setTimeout(() => searchNFTs(), 100); // Small delay to ensure UI updates first
-    }
-  } catch (error) {
-    console.error("Error validating RPC URL:", error);
-    rpcError.textContent =
-      "Error: " + (error.message || "Failed to validate RPC");
-    rpcError.style.display = "block";
-  } finally {
-    saveButton.disabled = false;
-    saveButton.textContent = "Use Custom RPC";
-  }
-}
-
-// Dismiss RPC prompt
-function dismissRPCPrompt() {
-  settings.promptShown = true;
-
-  // Save to localStorage
-  localStorage.setItem(
-    "solanaWalletSearcherSettings",
-    JSON.stringify(settings)
-  );
-
-  // Close modal
-  closeModal("rpc-prompt-modal");
-
-  // Restart the search
-  if (document.getElementById("tokens-tab").classList.contains("active")) {
-    searchTokens();
-  } else {
-    searchNFTs();
-  }
-}
-
-// Close modal
-function closeModal(modalId) {
-  document.getElementById(modalId).style.display = "none";
-}
-
-// Load settings from localStorage
-function loadSettings() {
-  const savedSettings = localStorage.getItem("solanaWalletSearcherSettings");
-
-  if (savedSettings) {
-    try {
-      // Parse saved settings
-      const parsedSettings = JSON.parse(savedSettings);
-
-      // Check if a custom RPC is set when required
-      if (
-        DEFAULT_RPC_REQUIRED &&
-        (!parsedSettings.rpcUrl || parsedSettings.rpcUrl === DEFAULT_RPC_URL)
-      ) {
-        // No valid custom RPC, reset promptShown to false to force the prompt
-        settings = {
-          rpcUrl: DEFAULT_RPC_URL,
-          promptShown: false,
-        };
-      } else {
-        // Make sure we have all expected properties
-        settings = {
-          rpcUrl: parsedSettings.rpcUrl || DEFAULT_RPC_URL,
-          promptShown: parsedSettings.promptShown === true, // Ensure boolean value
-        };
-      }
-    } catch (error) {
-      console.error("Error parsing settings from localStorage:", error);
-
-      // Reset to defaults if there's an error
-      settings = {
-        rpcUrl: DEFAULT_RPC_URL,
-        promptShown: false,
-      };
-    }
-  } else {
-    settings = {
-      rpcUrl: DEFAULT_RPC_URL,
-      promptShown: false,
-    };
-  }
-}
-
-// Main function to search for tokens
-async function searchTokens() {
-  if (window.isProcessing) return;
-  window.isProcessing = true;
-
-  // Clear previous results
-  window.tokenResults = [];
-  document.getElementById("tokens-result").style.display = "none";
-  document.getElementById("tokens-result-container").innerHTML = "";
-  document.getElementById("error-message").style.display = "none";
-  document.getElementById("success-message").style.display = "none";
-
-  // Show loader
-  document.getElementById("loader").style.display = "block";
-
-  // SIMPLE CHECK: See if we have a valid custom RPC in localStorage
-  let hasCustomRpc = false;
-  const savedSettings = localStorage.getItem("solanaWalletSearcherSettings");
-
-  if (savedSettings) {
-    try {
-      const parsedSettings = JSON.parse(savedSettings);
-      if (
-        parsedSettings &&
-        parsedSettings.rpcUrl &&
-        parsedSettings.rpcUrl.trim() !== ""
-      ) {
-        // Found a non-empty RPC URL in settings
-        if (parsedSettings.rpcUrl.startsWith("http")) {
-          hasCustomRpc = true;
-          window.settings.rpcUrl = parsedSettings.rpcUrl;
-        }
-      }
-    } catch (error) {
-      console.error("Error parsing settings:", error);
-    }
-  }
-
-  // If custom RPC is required but not found, show prompt and exit
-  if (DEFAULT_RPC_REQUIRED && !hasCustomRpc) {
-    window.showRPCPrompt();
-    document.getElementById("loader").style.display = "none";
-    window.isProcessing = false;
-    return;
-  }
-
-  // Constants
-  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC token address
-  const MIN_TOKEN_AMOUNT = 0.000001; // Minimum amount to show
-  const MIN_USDC_VALUE = 0.01; // Minimum USDC value to show
-  const JUPITER_API_BASE_URL = "https://lite-api.jup.ag/swap/v1"; // Jupiter API
-  const API_REQUEST_DELAY = 500; // Delay between API requests in ms
-  const WALLET_PROCESSING_DELAY = 500; // Delay between processing wallets (0.5 seconds)
-
-  // Check if we should display small balances
-  const displaySmallBalances = document.getElementById("displaySmallBalances")
-    ? document.getElementById("displaySmallBalances").checked
-    : false;
-
-  try {
-    // Get wallet addresses
-    window.walletAddresses = await window.getWalletAddresses();
-
-    if (window.walletAddresses.length === 0) {
-      throw new Error("Please enter at least one wallet address");
-    }
-
-    // Get specific token addresses (if applicable)
-    const showAllTokens = document.getElementById("showAllTokens").checked;
-    let specificTokens = [];
-
-    if (!showAllTokens) {
-      const tokenAddressesInput =
-        document.getElementById("tokenAddresses").value;
-      specificTokens = tokenAddressesInput
-        .split(/[\r\n]+/)
-        .filter((address) => address.trim() !== "")
-        .map((address) => address.trim());
-
-      if (specificTokens.length === 0) {
-        throw new Error(
-          "Please enter at least one token address or select 'Show all non-zero token balances'"
-        );
-      }
-    }
-
-    // Create Solana connection with explicit RPC URL
-    const rpcUrl = window.settings.rpcUrl;
-    // Create connection with explicit URL parameter
-    const connection = new solanaWeb3.Connection(rpcUrl, "confirmed");
-
-    // Test the connection to verify it's working with the correct RPC
-    try {
-      const slot = await connection.getSlot();
-    } catch (connError) {
-      console.error("Connection test failed:", connError);
-      throw new Error(`Failed to connect to RPC: ${connError.message}`);
-    }
-
-    // Show progress bar
-    document.getElementById("progress-container").style.display = "block";
-    document.getElementById(
-      "progress-text"
-    ).textContent = `0/${window.walletAddresses.length}`;
-    document.getElementById("progress-bar").style.width = "0%";
-
-    // Create a map to track wallet balances for sorting later
-    const walletTotalUsdValues = {};
-
-    // Process each wallet address
-    for (let i = 0; i < window.walletAddresses.length; i++) {
-      try {
-        const walletAddress = window.walletAddresses[i].trim();
-
-        // Initialize wallet's total USDC value
-        walletTotalUsdValues[walletAddress] = 0;
-
-        // Create wallet public key
-        const walletPublicKey = new solanaWeb3.PublicKey(walletAddress);
-
-        // Get SOL balance
-        try {
-          const solBalance = await connection.getBalance(walletPublicKey);
-          const solBalanceInSol = solBalance / 1000000000; // Convert lamports to SOL
-
-          // Add SOL balance to results
-          window.tokenResults.push({
-            walletAddress,
-            tokenAddress: "So11111111111111111111111111111111111111112", // Native SOL wrapped address
-            tokenName: "Solana",
-            symbol: "SOL",
-            logo: null,
-            balance: solBalance.toString(),
-            decimals: 9,
-            amountFloat: solBalanceInSol,
-            usdcValue: null, // Will be populated later
-            isNativeSol: true,
-          });
-
-          // Get SOL price in USDC
-          try {
-            // Add small delay before API call
-            await new Promise((resolve) =>
-              setTimeout(resolve, API_REQUEST_DELAY)
-            );
-
-            const solUsdcValue = await getTokenUsdcValue(
-              "So11111111111111111111111111111111111111112",
-              "1000000000", // 1 SOL in lamports
-              9
-            );
-
-            if (solUsdcValue) {
-              // Calculate total SOL value
-              const totalSolValue = solBalanceInSol * solUsdcValue;
-
-              // Update the SOL entry in results
-              const solEntry = window.tokenResults.find(
-                (t) => t.walletAddress === walletAddress && t.isNativeSol
-              );
-
-              if (solEntry) {
-                solEntry.usdcValue = totalSolValue;
-                // Add to wallet's total USDC value
-                walletTotalUsdValues[walletAddress] += totalSolValue;
-              }
-            }
-          } catch (solPriceError) {
-            console.warn("Failed to get SOL price:", solPriceError);
-          }
-        } catch (solBalanceError) {
-          console.error("Error getting SOL balance:", solBalanceError);
-        }
-
-        // If specific tokens are provided and not showing all tokens
-        if (!showAllTokens && specificTokens.length > 0) {
-          // Process each specific token
-          for (const specificToken of specificTokens) {
-            try {
-              const tokenMintPubkey = new solanaWeb3.PublicKey(specificToken);
-              // Using mint parameter to filter by specific token mint
-              const tokenAccounts =
-                await connection.getParsedTokenAccountsByOwner(
-                  walletPublicKey,
-                  { mint: tokenMintPubkey }
-                );
-
-              // Process each token account
-              for (const account of tokenAccounts.value) {
-                try {
-                  // Extract data using the expected structure
-                  const parsedInfo = account.account.data.parsed.info;
-                  const mintAddress = parsedInfo.mint;
-                  const tokenAmount = parsedInfo.tokenAmount;
-                  const decimals = parseInt(tokenAmount.decimals);
-
-                  // Skip tokens with 0 decimals (likely NFTs)
-                  if (decimals === 0) {
-                    continue;
-                  }
-
-                  // Convert token amount to a readable format
-                  const amountBigInt = BigInt(tokenAmount.amount);
-                  const amountFloat =
-                    Number(amountBigInt) / Math.pow(10, decimals);
-
-                  // Skip tokens with very small balances unless displaySmallBalances is enabled
-                  if (!displaySmallBalances && amountFloat < MIN_TOKEN_AMOUNT) {
-                    continue;
-                  }
-
-                  // Get token metadata using our service
-                  const metadata = await TokenService.getTokenMetadata(
-                    connection,
-                    mintAddress
-                  );
-
-                  // Add small delay before price API call
-                  await new Promise((resolve) =>
-                    setTimeout(resolve, API_REQUEST_DELAY)
-                  );
-
-                  // Get token price data if not USDC
-                  let usdcValue = null;
-                  if (mintAddress !== USDC_MINT && amountFloat > 0) {
-                    try {
-                      // Get price quote from Jupiter
-                      usdcValue = await getTokenUsdcValue(
-                        mintAddress,
-                        amountBigInt.toString(),
-                        decimals
-                      );
-
-                      // Skip tokens with value less than $0.01 USDC unless displaySmallBalances is enabled
-                      if (!displaySmallBalances && usdcValue < MIN_USDC_VALUE) {
-                        continue;
-                      }
-
-                      // Add to wallet's total USDC value
-                      if (usdcValue) {
-                        walletTotalUsdValues[walletAddress] += usdcValue;
-                      }
-                    } catch (priceError) {
-                      console.warn(
-                        `Failed to get price for token ${mintAddress}:`,
-                        priceError
-                      );
-                      // If we can't get price and displaySmallBalances is not enabled, skip this token
-                      if (!displaySmallBalances) {
-                        continue;
-                      }
-                    }
-                  } else if (mintAddress === USDC_MINT) {
-                    // If this is USDC, value is just the amount
-                    usdcValue = amountFloat;
-
-                    // Skip USDC with value less than $0.01 unless displaySmallBalances is enabled
-                    if (!displaySmallBalances && usdcValue < MIN_USDC_VALUE) {
-                      continue;
-                    }
-
-                    // Add to wallet's total USDC value
-                    if (usdcValue) {
-                      walletTotalUsdValues[walletAddress] += usdcValue;
-                    }
-                  }
-
-                  // Add to token results
-                  window.tokenResults.push({
-                    walletAddress,
-                    tokenAddress: mintAddress,
-                    tokenName: metadata.name || "Unknown",
-                    symbol: metadata.symbol || "Unknown",
-                    logo: metadata.logo,
-                    balance: tokenAmount.amount,
-                    decimals: tokenAmount.decimals,
-                    amountFloat: amountFloat,
-                    usdcValue: usdcValue,
-                  });
-                } catch (parseError) {
-                  console.error("Error parsing token account:", parseError);
-                }
-              }
-            } catch (tokenError) {
-              console.error(
-                `Error processing specific token ${specificToken}:`,
-                tokenError
-              );
-            }
-          }
-        } else {
-          // Show all tokens logic (original code)
-          const TOKEN_PROGRAM_ID =
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-          const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
-            walletPublicKey,
-            { programId: new solanaWeb3.PublicKey(TOKEN_PROGRAM_ID) }
-          );
-
-          // Process each token account
-          for (const account of tokenAccounts.value) {
-            try {
-              // Extract data using the expected structure
-              const parsedInfo = account.account.data.parsed.info;
-              const mintAddress = parsedInfo.mint;
-              const tokenAmount = parsedInfo.tokenAmount;
-              const decimals = parseInt(tokenAmount.decimals);
-
-              // Skip zero balances if showing all tokens
-              if (showAllTokens && tokenAmount.amount === "0") {
-                continue;
-              }
-
-              // Skip tokens with 0 decimals (likely NFTs)
-              if (decimals === 0) {
-                continue;
-              }
-
-              // Convert token amount to a readable format
-              const amountBigInt = BigInt(tokenAmount.amount);
-              const amountFloat = Number(amountBigInt) / Math.pow(10, decimals);
-
-              // Skip tokens with very small balances unless displaySmallBalances is enabled
-              if (!displaySmallBalances && amountFloat < MIN_TOKEN_AMOUNT) {
-                continue;
-              }
-
-              // Get token metadata using our service
-              const metadata = await TokenService.getTokenMetadata(
-                connection,
-                mintAddress
-              );
-
-              // Add small delay before price API call
-              await new Promise((resolve) =>
-                setTimeout(resolve, API_REQUEST_DELAY)
-              );
-
-              // Get token price data if not USDC
-              let usdcValue = null;
-              if (mintAddress !== USDC_MINT && amountFloat > 0) {
-                try {
-                  // Get price quote from Jupiter
-                  usdcValue = await getTokenUsdcValue(
-                    mintAddress,
-                    amountBigInt.toString(),
-                    decimals
-                  );
-
-                  // Skip tokens with value less than $0.01 USDC unless displaySmallBalances is enabled
-                  if (!displaySmallBalances && usdcValue < MIN_USDC_VALUE) {
-                    continue;
-                  }
-
-                  // Add to wallet's total USDC value
-                  if (usdcValue) {
-                    walletTotalUsdValues[walletAddress] += usdcValue;
-                  }
-                } catch (priceError) {
-                  console.warn(
-                    `Failed to get price for token ${mintAddress}:`,
-                    priceError
-                  );
-                  // If we can't get price and displaySmallBalances is not enabled, skip this token
-                  if (!displaySmallBalances) {
-                    continue;
-                  }
-                }
-              } else if (mintAddress === USDC_MINT) {
-                // If this is USDC, value is just the amount
-                usdcValue = amountFloat;
-
-                // Skip USDC with value less than $0.01 unless displaySmallBalances is enabled
-                if (!displaySmallBalances && usdcValue < MIN_USDC_VALUE) {
-                  continue;
-                }
-
-                // Add to wallet's total USDC value
-                if (usdcValue) {
-                  walletTotalUsdValues[walletAddress] += usdcValue;
-                }
-              }
-
-              // Add to token results
-              window.tokenResults.push({
-                walletAddress,
-                tokenAddress: mintAddress,
-                tokenName: metadata.name || "Unknown",
-                symbol: metadata.symbol || "Unknown",
-                logo: metadata.logo,
-                balance: tokenAmount.amount,
-                decimals: tokenAmount.decimals,
-                amountFloat: amountFloat,
-                usdcValue: usdcValue,
-              });
-            } catch (parseError) {
-              console.error("Error parsing token account:", parseError);
-            }
-          }
-        }
-      } catch (walletError) {
-        console.error(`Error processing wallet:`, walletError);
-        // Add error result
-        window.tokenResults.push({
-          walletAddress: window.walletAddresses[i],
-          error: walletError.message,
-        });
-      }
-
-      // Update progress
-      document.getElementById("progress-text").textContent = `${i + 1}/${
-        window.walletAddresses.length
-      }`;
-      document.getElementById("progress-bar").style.width = `${
-        ((i + 1) / window.walletAddresses.length) * 100
-      }%`;
-
-      // Add delay between processing wallets to avoid rate limits
-      if (i < window.walletAddresses.length - 1) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, WALLET_PROCESSING_DELAY)
-        );
-      }
-    }
-
-    // Calculate total USDC value for each wallet (for display)
-    window.walletTotalValues = walletTotalUsdValues;
-
-    // Sort results by USDC value (if available)
-    window.tokenResults.sort((a, b) => {
-      // Handle error entries (always at the bottom)
-      if (a.error) return 1;
-      if (b.error) return -1;
-
-      // Sort by wallet address and total value
-      const walletA = a.walletAddress;
-      const walletB = b.walletAddress;
-
-      // Compare total wallet values
-      const totalValueA = walletTotalUsdValues[walletA] || 0;
-      const totalValueB = walletTotalUsdValues[walletB] || 0;
-
-      // Sort wallets by total value, then by tokens within the same wallet
-      if (walletA !== walletB) {
-        return totalValueB - totalValueA; // Sort wallets by descending total value
-      }
-
-      // For tokens in the same wallet, keep SOL at the top, then sort by value
-      if (a.isNativeSol) return -1;
-      if (b.isNativeSol) return 1;
-
-      // Handle missing USDC values
-      const aValue = a.usdcValue !== null ? a.usdcValue : 0;
-      const bValue = b.usdcValue !== null ? b.usdcValue : 0;
-
-      // Sort descending (highest value first)
-      return bValue - aValue;
-    });
-
-    // Display results
-    window.displayTokenResults();
-
-    // Show success message
-    const successMessage =
-      window.walletAddresses.length === 1
-        ? "Successfully processed 1 wallet address."
-        : `Successfully processed ${window.walletAddresses.length} wallet addresses.`;
-    document.getElementById("success-message").textContent = successMessage;
-    document.getElementById("success-message").style.display = "block";
-  } catch (error) {
-    console.error("Error searching tokens:", error);
-    document.getElementById("error-message").textContent = error.message;
-    document.getElementById("error-message").style.display = "block";
-  } finally {
-    // Hide loader and progress
-    document.getElementById("loader").style.display = "none";
-    document.getElementById("progress-container").style.display = "none";
-    window.isProcessing = false;
-  }
-}
-
-/**
- * Get token value in USDC
- * @param {string} inputMint - Token mint address
- * @param {string} amount - Token amount in smallest units (lamports)
- * @param {number} decimals - Token decimals
- * @returns {Promise<number>} - USDC value of the token amount
- */
-async function getTokenUsdcValue(inputMint, amount, decimals) {
-  const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-  const JUPITER_API_BASE_URL = "https://lite-api.jup.ag/swap/v1";
-
-  try {
-    // Build query parameters
-    const params = new URLSearchParams({
-      inputMint: inputMint,
-      outputMint: USDC_MINT,
-      amount: amount,
-      slippageBps: 50, // 0.5% slippage tolerance
-    });
-
-    const url = `${JUPITER_API_BASE_URL}/quote?${params.toString()}`;
-    console.log(`Requesting Jupiter quote from: ${url}`);
-
-    // Set timeout to prevent long-hanging requests
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
-
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      console.warn(`Jupiter API returned status: ${response.status}`);
-      throw new Error(`Jupiter API error: ${response.status}`);
-    }
-
-    const quoteResponse = await response.json();
-
-    // Check if the response has the expected properties
-    if (!quoteResponse.outAmount) {
-      console.warn(
-        "Jupiter API response missing outAmount property:",
-        quoteResponse
-      );
-      return null;
-    }
-
-    // Calculate USDC value (convert from smallest units to USDC)
-    const outAmount = BigInt(quoteResponse.outAmount);
-    const usdcValue = Number(outAmount) / Math.pow(10, 6); // USDC has 6 decimals
-
-    console.log(`Token USDC value calculated: ${usdcValue}`);
-    return usdcValue;
-  } catch (error) {
-    console.warn(`Error getting Jupiter quote: ${error.message}`);
-    return null; // Return null instead of throwing
-  }
-}
-
-if (typeof TokenService !== "undefined") {
-  TokenService.searchTokens = searchTokens;
-} else {
-  window.TokenService = {
-    searchTokens: searchTokens,
-  };
-}
-
-// Download CSV functionality
-function downloadCSV(type) {
-  let data, filename;
-
-  if (type === "tokens") {
-    // Access the window.tokenResults directly to ensure we have the data
-    data = window.tokenResults;
-    filename = "solana_token_results.csv";
-
-    if (!data || data.length === 0) {
-      alert("No token data to download");
-      return;
-    }
-
-    // Create CSV content - match the display order in the table
-    let csvContent =
-      "Wallet Address,Symbol,Token Name,Token Address,Balance,USDC Value\n";
-
-    data.forEach((result) => {
-      if (result.error) {
-        csvContent += `${result.walletAddress},"Error: ${result.error}",,,,\n`;
-      } else {
-        const formattedBalance = formatTokenBalance(
-          result.balance,
-          result.decimals
-        );
-        const formattedValue =
-          result.usdcValue !== null ? result.usdcValue.toFixed(2) : "N/A";
-        csvContent += `${result.walletAddress},${result.symbol || "Unknown"},"${
-          result.tokenName || "Unknown"
-        }",${result.tokenAddress},${formattedBalance},${formattedValue}\n`;
-      }
-    });
-
-    // Create and download the file
-    downloadFile(csvContent, filename);
-  } else if (type === "nfts") {
-    // Access the window.nftResults directly to ensure we have the data
-    data = window.nftResults;
-    filename = "solana_nft_results.csv";
-
-    if (!data || data.length === 0) {
-      alert("No NFT data to download");
-      return;
-    }
-
-    // Create CSV content - match the display order in the table
-    let csvContent =
-      "Wallet Address,Collection Address,Collection Name,NFT Name,NFT Address\n";
-
-    data.forEach((result) => {
-      if (result.error) {
-        csvContent += `${result.walletAddress},"Error: ${result.error}",,,,\n`;
-      } else {
-        csvContent += `${result.walletAddress},${
-          result.collectionAddress || "N/A"
-        },"${result.collectionName || "Unknown"}","${
-          result.nftName || "Unknown"
-        }",${result.nftAddress}\n`;
-      }
-    });
-
-    // Create and download the file
-    downloadFile(csvContent, filename);
-  }
-}
-
-async function searchNFTs() {
-  // Use a specific flag to prevent infinite recursion
-  if (window.isNFTProcessing) {
-    return;
-  }
-
-  window.isNFTProcessing = true;
-
-  // Clear previous results
-  window.nftResults = []; // Make sure we're using window.nftResults
-  document.getElementById("nfts-result").style.display = "none";
-  document.getElementById("nfts-result-container").innerHTML = "";
-  document.getElementById("nft-error-message").style.display = "none";
-  document.getElementById("nft-success-message").style.display = "none";
-
-  // Show loader
-  document.getElementById("nft-loader").style.display = "block";
-
-  // SIMPLE CHECK: See if we have a valid custom RPC in localStorage
-  let hasCustomRpc = false;
-  const savedSettings = localStorage.getItem("solanaWalletSearcherSettings");
-
-  if (savedSettings) {
-    try {
-      const parsedSettings = JSON.parse(savedSettings);
-      if (
-        parsedSettings &&
-        parsedSettings.rpcUrl &&
-        parsedSettings.rpcUrl.trim() !== ""
-      ) {
-        // Found a non-empty RPC URL in settings
-        if (parsedSettings.rpcUrl.startsWith("http")) {
-          hasCustomRpc = true;
-          window.settings.rpcUrl = parsedSettings.rpcUrl;
-        }
-      }
-    } catch (error) {
-      console.error("Error parsing settings:", error);
-    }
-  }
-
-  // If custom RPC is required but not found, show prompt and exit
-  if (DEFAULT_RPC_REQUIRED && !hasCustomRpc) {
-    window.showRPCPrompt();
-    document.getElementById("nft-loader").style.display = "none";
-    window.isNFTProcessing = false;
-    return;
-  }
-
-  try {
-    // Constants
-    const WALLET_PROCESSING_DELAY = 1500; // Delay between processing wallets (1.5 seconds)
-
-    // Get wallet addresses
-    window.walletAddresses = await window.getWalletAddresses();
-    if (window.walletAddresses.length === 0) {
-      throw new Error("Please enter at least one wallet address");
-    }
-
-    // Show progress bar
-    document.getElementById("nft-progress-container").style.display = "block";
-    document.getElementById(
-      "nft-progress-text"
-    ).textContent = `0/${window.walletAddresses.length}`;
-    document.getElementById("nft-progress-bar").style.width = "0%";
-
-    // Get search parameters
-    const showAllNFTs = document.getElementById("showAllNFTs").checked;
-    let specificCollections = [];
-
-    if (!showAllNFTs) {
-      const nftCollectionAddresses = document.getElementById(
-        "nftCollectionAddresses"
-      ).value;
-      specificCollections = nftCollectionAddresses
-        .split(/[\r\n]+/)
-        .filter((address) => address.trim() !== "");
-
-      if (specificCollections.length === 0) {
-        throw new Error(
-          "Please enter at least one NFT collection address or select 'Show all NFTs'"
-        );
-      }
-    }
-
-    // Check if Metaplex libraries are available
-    if (!window.metaplex || !window.metaplex.Metaplex) {
-      throw new Error(
-        "Metaplex libraries not found. Please refresh the page and try again."
-      );
-    }
-
-    // Create a map to track wallet NFT counts for sorting
-    const walletNftCounts = {};
-
-    // Create a Metaplex instance with our validated RPC URL
-    const metaplex = window.metaplex.Metaplex.make(
-      new solanaWeb3.Connection(window.settings.rpcUrl, "confirmed")
-    );
-
-    // Process each wallet address
-    for (let i = 0; i < window.walletAddresses.length; i++) {
-      try {
-        const walletAddress = window.walletAddresses[i].trim();
-        // Initialize wallet's NFT count
-        walletNftCounts[walletAddress] = 0;
-        // Create wallet public key
-        const walletPublicKey = new solanaWeb3.PublicKey(walletAddress);
-
-        // Fetch NFTs using Metaplex JS SDK
-        const nfts = await metaplex
-          .nfts()
-          .findAllByOwner({ owner: walletPublicKey });
-
-        // Filter by collection if needed
-        let filteredNfts = nfts;
-        if (!showAllNFTs && specificCollections.length > 0) {
-          filteredNfts = nfts.filter((nft) => {
-            const collectionAddress = nft.collection?.address?.toString();
-            return (
-              collectionAddress &&
-              specificCollections.includes(collectionAddress)
-            );
-          });
-        }
-
-        // Update NFT count for wallet (for sorting)
-        walletNftCounts[walletAddress] = filteredNfts.length;
-
-        // Process each NFT
-        for (const nft of filteredNfts) {
-          try {
-            // Get collection info if available
-            let collectionName = "Unknown Collection";
-            let collectionAddress = null;
-
-            if (nft.collection?.address) {
-              collectionAddress = nft.collection.address.toString();
-              try {
-                // Try to get collection NFT details
-                const collectionNft = await metaplex.nfts().findByMint({
-                  mintAddress: nft.collection.address,
-                });
-                if (collectionNft) {
-                  collectionName = collectionNft.name || "Unknown Collection";
-                }
-              } catch (collErr) {
-                console.warn(
-                  `Error fetching collection details: ${collErr.message}`
-                );
-              }
-            }
-
-            // Add to results
-            window.nftResults.push({
-              walletAddress,
-              nftAddress: nft.mintAddress.toString(),
-              nftName: nft.name || `NFT #${window.nftResults.length + 1}`,
-              collectionAddress,
-              collectionName,
-            });
-          } catch (nftError) {
-            console.error(`Error processing NFT: ${nftError.message}`);
-          }
-        }
-      } catch (walletError) {
-        console.error(`Error processing wallet:`, walletError);
-        // Add error result
-        window.nftResults.push({
-          walletAddress: window.walletAddresses[i],
-          error: walletError.message,
-        });
-      }
-
-      // Update progress
-      document.getElementById("nft-progress-text").textContent = `${i + 1}/${
-        window.walletAddresses.length
-      }`;
-      document.getElementById("nft-progress-bar").style.width = `${
-        ((i + 1) / window.walletAddresses.length) * 100
-      }%`;
-
-      // Add delay between processing wallets to avoid rate limits
-      if (i < window.walletAddresses.length - 1) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, WALLET_PROCESSING_DELAY)
-        );
-      }
-    }
-
-    // Store NFT counts for display
-    window.walletNftCounts = walletNftCounts;
-
-    // Sort NFT results by wallet with most NFTs
-    window.nftResults.sort((a, b) => {
-      // Handle error entries (always at the bottom)
-      if (a.error) return 1;
-      if (b.error) return -1;
-
-      // Sort by wallet address and NFT count
-      const walletA = a.walletAddress;
-      const walletB = b.walletAddress;
-
-      // Compare wallet NFT counts
-      const countA = walletNftCounts[walletA] || 0;
-      const countB = walletNftCounts[walletB] || 0;
-
-      // Sort wallets by NFT count, then alphabetically for NFTs within the same wallet
-      if (walletA !== walletB) {
-        return countB - countA; // Sort wallets by descending NFT count
-      }
-
-      // For NFTs in the same wallet, sort by collection name then NFT name
-      if (a.collectionName !== b.collectionName) {
-        return a.collectionName.localeCompare(b.collectionName);
-      }
-
-      return a.nftName.localeCompare(b.nftName);
-    });
-
-    // Make sure we're calling the correct display function with the right array
-    if (window.nftResults.length > 0) {
-      window.displayNFTResults();
-    } else {
-      console.warn("No NFTs found to display");
-      document.getElementById("nfts-result-container").innerHTML =
-        "<p>No NFTs found.</p>";
-      document.getElementById("nfts-result").style.display = "block";
-    }
-
-    // Show success message
-    const successMessage =
-      window.walletAddresses.length === 1
-        ? "Successfully processed 1 wallet address."
-        : `Successfully processed ${window.walletAddresses.length} wallet addresses.`;
-    document.getElementById("nft-success-message").textContent = successMessage;
-    document.getElementById("nft-success-message").style.display = "block";
-  } catch (error) {
-    console.error("Error searching NFTs:", error);
-    document.getElementById("nft-error-message").textContent = error.message;
-    document.getElementById("nft-error-message").style.display = "block";
-  } finally {
-    // Hide loader and progress
-    document.getElementById("nft-loader").style.display = "none";
-    document.getElementById("nft-progress-container").style.display = "none";
-    window.isNFTProcessing = false;
-  }
-}
-
-if (typeof NFTService !== "undefined") {
-  NFTService.searchNFTs = searchNFTs;
-} else {
-  window.NFTService = {
-    searchNFTs: searchNFTs,
-  };
-}
-
-// Function to view token on Solscan
-function viewTokenOnSolscan(walletAddress, tokenMintAddress) {
-  if (typeof TokenService !== "undefined" && TokenService.viewTokenOnSolscan) {
-    TokenService.viewTokenOnSolscan(walletAddress, tokenMintAddress);
-  } else {
-    // Fallback to direct link if service is not available
-    window.open(`https://solscan.io/token/${tokenMintAddress}`, "_blank");
-  }
-}
-
-async function validateRpcUrl(url) {
-  try {
-    // Create a connection with the URL
-    const connection = new solanaWeb3.Connection(url, "confirmed");
-    // Try to get the current slot as a basic test
-    const slot = await connection.getSlot();
+    // Recheck durable consent: another tab may have cleared the saved list.
+    if (!optIn && readRememberedWallets(localStorage.getItem(WALLETS_KEY)) === null) { $("rememberWallets").checked = false; return false; }
+    localStorage.setItem(WALLETS_KEY, JSON.stringify({ remember: true, wallets }));
     return true;
-  } catch (error) {
-    console.error("RPC validation failed:", error);
+  } catch {
+    if (optIn) $("rememberWallets").checked = false;
+    toast("Couldn’t save wallets in this browser. Your search can still continue.");
     return false;
   }
 }
 
-// Make variables and functions available to other scripts
-window.displayTokenResults = displayTokenResults;
-window.displayNFTResults = displayNFTResults;
-window.getWalletAddresses = getWalletAddresses;
-window.showRPCPrompt = showRPCPrompt;
-window.settings = settings;
-window.tokenResults = tokenResults;
-window.nftResults = nftResults;
-window.walletAddresses = walletAddresses;
-window.isProcessing = isProcessing;
-window.DEFAULT_RPC_URL = DEFAULT_RPC_URL;
-window.RPC_DELAY_MS = RPC_DELAY_MS;
-window.searchTokens = searchTokens;
-window.getTokenUsdcValue = getTokenUsdcValue;
-window.downloadCSV = downloadCSV;
-window.searchNFTs = searchNFTs;
-window.createTokenTableRow = createTokenTableRow;
-window.createNFTTableRow = createNFTTableRow;
+function changeRememberWallets() {
+  if ($("rememberWallets").checked) {
+    saveRememberedWallets(lastRun?.wallets || searches.tokens.wallets, true);
+    return;
+  }
+  try { localStorage.removeItem(WALLETS_KEY); toast("Saved wallets cleared"); }
+  catch { $("rememberWallets").checked = true; toast("Couldn’t clear saved wallets. Check this site’s storage permissions."); }
+}
+
+function syncRememberedWallets(event) {
+  if (event.key !== WALLETS_KEY && event.key !== null) return;
+  try { $("rememberWallets").checked = readRememberedWallets(event.newValue) !== null; }
+  catch { $("rememberWallets").checked = false; }
+  // Preserve unsaved input in this tab; only future searches follow the new preference.
+}
+
+function inputError(message = "") {
+  $("wallet-input-error").textContent = message;
+  $("wallet-input-error").hidden = !message;
+  $("walletAddresses").setAttribute("aria-invalid", String(Boolean(message)));
+}
+
+function importFeedback(text, state) {
+  $("import-feedback").hidden = false;
+  $("import-feedback").dataset.state = state;
+  $("import-status").textContent = text;
+}
+
+async function importWalletFile(file) {
+  if (!file || activeSearch) return;
+  const version = ++importVersion;
+  inputError();
+  $("undoImportBtn").hidden = true;
+  importing = true;
+  importFeedback(`Importing ${file.name}…`, "loading");
+  try {
+    if (file.size > MAX_INPUT_BYTES) throw new Error("The file is too large. Import a file smaller than 2 MB.");
+    if (!/\.(txt|csv)$/i.test(file.name)) throw new Error("Choose a TXT or CSV file.");
+    const addresses = parseWalletFile(await file.text(), file.name);
+    if (version !== importVersion) return;
+    if (!addresses.length) throw new Error("This file contains no wallet addresses.");
+    if (addresses.length > MAX_WALLETS) throw new Error(`Import up to ${MAX_WALLETS.toLocaleString()} wallets at a time.`);
+    // Merge into the current input, including edits made while the file was read.
+    const current = getWalletAddresses();
+    const existing = new Set(current);
+    const added = addresses.filter((address) => !existing.has(address));
+    if (current.length + added.length > MAX_WALLETS) throw new Error(`Search up to ${MAX_WALLETS.toLocaleString()} wallets at a time.`);
+    if (added.length) $("walletAddresses").value = [...current, ...added].join("\n");
+    lastImport = added.length ? added : null;
+    $("undoImportBtn").hidden = !added.length;
+    $("undoImportBtn").textContent = "Undo import";
+    importFeedback(added.length ? `${file.name} · ${added.length} wallet${added.length === 1 ? "" : "s"} added` : `${file.name} · All wallets already in your list`, "success");
+  } catch (error) {
+    if (version !== importVersion) return;
+    importFeedback(`Couldn’t import ${file.name}`, "error");
+    inputError(error.message);
+    // A failed import leaves the existing wallet list and its undo action intact.
+    $("undoImportBtn").hidden = !lastImport;
+    $("undoImportBtn").textContent = "Undo previous import";
+  } finally {
+    if (version === importVersion) importing = false;
+  }
+}
+
+function undoImport() {
+  if (!lastImport || importing) return;
+  const added = new Set(lastImport);
+  $("walletAddresses").value = getWalletAddresses().filter((address) => !added.has(address)).join("\n");
+  lastImport = null;
+  $("import-feedback").hidden = true;
+  $("undoImportBtn").hidden = true;
+  inputError();
+  $("walletAddresses").focus();
+  toast("Import undone");
+}
+
+function setupWalletImport() {
+  $("importWalletsBtn").addEventListener("click", () => $("walletFile").click());
+  $("walletFile").addEventListener("change", () => {
+    const file = $("walletFile").files[0];
+    $("walletFile").value = ""; // Choosing the same file again should still import it.
+    importWalletFile(file);
+  });
+  $("undoImportBtn").addEventListener("click", undoImport);
+  const zone = $("wallet-drop-zone");
+  let dragDepth = 0;
+  const isFileDrag = (event) => [...(event.dataTransfer?.types || [])].includes("Files");
+  zone.addEventListener("dragenter", (event) => {
+    if (!isFileDrag(event) || $("walletAddresses").disabled) return;
+    event.preventDefault(); dragDepth++;
+    zone.classList.add("drag-over");
+  });
+  zone.addEventListener("dragover", (event) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = $("walletAddresses").disabled ? "none" : "copy";
+  });
+  zone.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) zone.classList.remove("drag-over");
+  });
+  zone.addEventListener("drop", (event) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault(); dragDepth = 0; zone.classList.remove("drag-over");
+    if ($("walletAddresses").disabled) return;
+    if (event.dataTransfer.files.length !== 1) { inputError("Import one TXT or CSV file at a time."); return; }
+    importWalletFile(event.dataTransfer.files[0]);
+  });
+}
+
+function setConnection(status, detail, state = "") {
+  $("connection-status").textContent = status;
+  $("connection-detail").textContent = detail;
+  $("connection-dot").className = `status-dot ${state}`;
+  $("settingsBtn").textContent = settings.rpcUrl ? "Connection settings" : "Set up RPC";
+}
+
+function openSettings(resumeSearch = false) {
+  pendingSearch = resumeSearch;
+  settingsReturnFocus = $(resumeSearch ? "searchBtn" : "settingsBtn");
+  $("rpcUrl").value = settings.rpcUrl;
+  $("rpc-error").hidden = true;
+  $("rpcUrl").removeAttribute("aria-invalid");
+  $("settings-modal").showModal();
+  $("rpcUrl").focus();
+}
+
+function normalizeRpcUrl(value) {
+  let url;
+  try { url = new URL(value.trim()); } catch { throw new Error("Enter a valid RPC URL."); }
+  const local = ["localhost", "127.0.0.1"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) throw new Error("Use an HTTPS RPC URL, or HTTP on localhost or 127.0.0.1.");
+  if (url.username || url.password) throw new Error("Use your provider’s HTTPS endpoint without embedded username or password credentials.");
+  url.hash = "";
+  return url.toString();
+}
+
+function createConnection(signal) {
+  return new solanaWeb3.Connection(settings.rpcUrl, { signal });
+}
+
+function loadSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+    if (typeof saved?.rpcUrl === "string" && saved.rpcUrl) settings.rpcUrl = normalizeRpcUrl(saved.rpcUrl);
+    if (settings.rpcUrl) setConnection("RPC saved", "Your saved endpoint will be checked when you search.");
+  } catch { toast("Saved connection settings could not be loaded. Add your RPC URL again."); }
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  if (settingsController) return;
+  const input = $("rpcUrl").value.trim();
+  const button = $("saveSettingsBtn");
+  const controller = new AbortController();
+  settingsController = controller;
+  const timer = setTimeout(() => controller.abort(), 12000);
+  button.disabled = true; button.textContent = "Testing connection…";
+  $("rpc-error").hidden = true;
+  try {
+    const url = normalizeRpcUrl(input);
+    if (!window.solanaWeb3) throw new Error("Solana tools could not load. Check your connection and reload the page.");
+    const connection = new solanaWeb3.Connection(url, { signal: controller.signal });
+    await withAbort(connection.getSlot(), controller.signal);
+    // Verify the endpoint's chain before persisting a mainnet-only configuration.
+    const genesis = await withAbort(connection.getGenesisHash(), controller.signal);
+    if (genesis !== MAINNET_GENESIS) throw new Error("This endpoint is not Solana mainnet. Choose a mainnet RPC URL.");
+    let savedToBrowser = true;
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ rpcUrl: url })); }
+    catch { savedToBrowser = false; }
+    settings.rpcUrl = url;
+    setConnection("Connected to Solana mainnet", "Connection verified. Wallet data is requested through your saved RPC endpoint.", "connected");
+    const resume = pendingSearch;
+    $("settings-modal").close();
+    toast(savedToBrowser ? "Connection saved" : "Connected for this visit. Your browser could not save the RPC URL.");
+    if (resume) runSearch();
+  } catch (error) {
+    if (!$("settings-modal").open) return;
+    // Provider errors can contain URLs with API keys; keep UI errors credential-free.
+    $("rpc-error").textContent = error.name === "AbortError"
+      ? "The connection test timed out. Check the endpoint and try again."
+      : (error.message.startsWith("Use ") || error.message.startsWith("This endpoint") || error.message.startsWith("Enter a") || error.message.startsWith("Solana tools"))
+        ? error.message : "Could not connect. Check your RPC URL, provider limits, and browser access (CORS).";
+    $("rpc-error").hidden = false;
+    $("rpcUrl").setAttribute("aria-invalid", "true");
+  } finally {
+    clearTimeout(timer);
+    if (settingsController === controller) settingsController = null;
+    button.disabled = false; button.textContent = "Test & save connection";
+  }
+}
+
+function withAbort(promise, signal, timeout = 40000) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); };
+    const abort = () => { cleanup(); reject(new DOMException("Cancelled", "AbortError")); };
+    // Attach both handlers even when already aborted, so late provider rejections are consumed.
+    Promise.resolve(promise).then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    if (signal.aborted) { abort(); return; }
+    signal.addEventListener("abort", abort, { once: true });
+    timer = setTimeout(() => { cleanup(); reject(new Error("The provider took too long to respond. Retry the search.")); }, timeout);
+  });
+}
+
+function assertActive(signal) {
+  if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
+}
+
+function wait(ms, signal) {
+  return new Promise((resolve, reject) => {
+    assertActive(signal);
+    const abort = () => { clearTimeout(timer); reject(new DOMException("Cancelled", "AbortError")); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function setBusy(busy) {
+  for (const id of ["walletAddresses", "walletFile", "importWalletsBtn", "undoImportBtn", "showAllTokens", "showAllNFTs", "includeNFTs", "tokenAddresses", "nftCollectionAddresses", "settingsBtn", "searchBtn"]) $(id).disabled = busy;
+  $("cancelSearchBtn").hidden = !busy;
+  $("searchBtn").textContent = busy ? "Searching…" : "Search wallets";
+  $("search-progress").hidden = !busy;
+  $("retrySearchBtn").disabled = busy;
+}
+
+function visibleTokens(results, includeSmall = $("displaySmallBalances").checked) {
+  return results.filter((token) => token.balance !== "0" && (includeSmall || token.usdcValue == null || token.usdcValue >= 0.01));
+}
+
+function searchMessage(text, tone = "") {
+  const element = $("search-message");
+  element.textContent = text; element.className = `message ${tone}`; element.hidden = !text;
+}
+
+function retryableWallets() {
+  if (!lastRun) return [];
+  return lastRun.wallets.filter(address => lastRun.kinds.some(kind => !searches[kind].checked.includes(address) || searches[kind].failures.has(address) || searches[kind].warnings.has(address)));
+}
+
+async function runSearch(retry = false) {
+  if (activeSearch) return;
+  inputError(); searchMessage("");
+  if (importing) { inputError("Wait for the file to finish importing."); return; }
+  if (!window.solanaWeb3) { searchMessage("Solana tools could not load. Reload the page and try again.", "error"); return; }
+  let plan;
+  if (retry && lastRun) plan = { ...lastRun, targets: retryableWallets() };
+  else {
+    if ($("walletAddresses").value.length > MAX_INPUT_BYTES) { inputError("The wallet list is too large. Search up to 1,000 wallets at a time."); return; }
+    const wallets = getWalletAddresses();
+    if (!wallets.length || wallets.length > MAX_WALLETS) { inputError(!wallets.length ? "Add at least one wallet address to begin." : "Search up to 1,000 wallets at a time."); $("walletAddresses").focus(); return; }
+    const invalid = wallets.filter(address => { try { new solanaWeb3.PublicKey(address); return false; } catch { return true; } });
+    if (invalid.length) { inputError(`${invalid.length} invalid wallet address${invalid.length === 1 ? "" : "es"}. Check: ${invalid.slice(0, 3).join(", ")}`); $("walletAddresses").focus(); return; }
+    const kinds = $("includeNFTs").checked ? ["tokens", "nfts"] : ["tokens"];
+    const filters = {};
+    for (const kind of kinds) {
+      const all = $(kind === "tokens" ? "showAllTokens" : "showAllNFTs").checked;
+      const field = $(kind === "tokens" ? "tokenAddresses" : "nftCollectionAddresses");
+      filters[kind] = all ? [] : uniqueAddresses(field.value);
+      if (!all) {
+        try {
+          if (!filters[kind].length || filters[kind].length > MAX_WALLETS) throw new Error();
+          filters[kind].forEach(address => new solanaWeb3.PublicKey(address));
+        } catch { searchMessage(`Enter valid ${kind === "tokens" ? "token mint" : "collection"} addresses, one per line.`, "error"); field.focus(); return; }
+      }
+    }
+    plan = { kinds, wallets, filters, targets: wallets };
+  }
+  if (!plan.targets.length) return;
+  if (!settings.rpcUrl) { openSettings(true); return; }
+  const { kinds, wallets, filters, targets } = plan;
+  const run = { ...plan, controller: new AbortController(), checked: [] };
+  activeSearch = run;
+  const { signal } = run.controller;
+  setBusy(true);
+  $("search-progress-bar").max = targets.length;
+  $("search-progress-bar").value = 0;
+  $("search-progress-text").textContent = `Checking connection…`;
+  let cancelled = false, committed = false;
+  try {
+    const connection = createConnection(signal);
+    try {
+      await withAbort(connection.getSlot(), signal);
+      if (await withAbort(connection.getGenesisHash(), signal) !== MAINNET_GENESIS) throw new Error("Wrong network");
+    } catch (error) {
+      if (error.name === "AbortError") throw error;
+      setConnection("Connection unavailable", "Check your mainnet endpoint and provider limits in connection settings.", "failed");
+      throw new Error("Could not verify a Solana mainnet connection. Check connection settings and retry. Previous results are kept.");
+    }
+    setConnection("Connected to Solana mainnet", "Connection verified. Ready to search.", "connected");
+    // Commit a new scan only after preflight succeeds; connection errors keep prior results.
+    if (!retry) {
+      for (const kind of Object.keys(searches)) {
+        const included = kinds.includes(kind);
+        Object.assign(searches[kind], { results: [], wallets: included ? wallets : [], checked: [], failures: new Map(), warnings: new Map(), hasSearched: included, running: included, limit: PAGE_SIZE, updatedAt: null });
+        renderResults(kind);
+      }
+      lastRun = { kinds, wallets, filters };
+      saveRememberedWallets(wallets);
+    } else kinds.forEach(kind => { searches[kind].running = true; });
+    committed = true;
+    $("search-empty").hidden = true;
+    $("retrySearchBtn").hidden = true;
+    for (const address of targets) {
+      for (const kind of kinds) {
+        assertActive(signal);
+        const search = searches[kind];
+        $("search-progress-text").textContent = `Checking ${kind === "tokens" ? "tokens" : "NFTs"} for ${abbreviateAddress(address)} · ${run.checked.length} of ${targets.length} wallets checked`;
+        try {
+          const result = kind === "tokens"
+            ? await loadTokenWallet(connection, address, filters.tokens, signal, partial => {
+                assertActive(signal);
+                const retrievedAt = new Date().toISOString();
+                search.results = search.results.filter(entry => entry.walletAddress !== address);
+                search.results.push(...partial.map(entry => ({ ...entry, retrievedAt })));
+                search.warnings.set(address, "Valuation was not completed. Retry to refresh these holdings.");
+                renderResults(kind);
+              })
+            : await loadNftWallet(connection, address, filters.nfts, signal);
+          assertActive(signal);
+          search.results = search.results.filter(entry => entry.walletAddress !== address);
+          const retrievedAt = new Date().toISOString();
+          search.results.push(...result.entries.map(entry => ({ ...entry, retrievedAt })));
+          search.failures.delete(address); search.warnings.delete(address);
+          if (result.warning) search.warnings.set(address, result.warning);
+        } catch (error) {
+          if (error.name === "AbortError") throw error;
+          search.failures.set(address, `Could not fetch ${kind === "tokens" ? "token" : "NFT"} holdings. Check your provider limits and retry this wallet.`);
+        }
+        if (!search.checked.includes(address)) search.checked.push(address);
+        search.updatedAt = new Date();
+        renderResults(kind);
+      }
+      run.checked.push(address);
+      $("search-progress-bar").value = run.checked.length;
+      if (run.checked.length < targets.length) await wait(200, signal);
+    }
+  } catch (error) {
+    cancelled = error.name === "AbortError";
+    if (!cancelled) searchMessage(error.message, "error");
+  } finally {
+    const restoreFocus = document.activeElement === $("cancelSearchBtn");
+    if (committed) for (const kind of kinds) { searches[kind].running = false; renderResults(kind); }
+    setBusy(false); activeSearch = null;
+    $("retrySearchBtn").hidden = !retryableWallets().length;
+    if (cancelled || $("search-message").hidden) {
+      const checked = committed ? wallets.filter(address => kinds.every(kind => searches[kind].checked.includes(address))).length : 0;
+      const failed = committed ? wallets.filter(address => kinds.every(kind => searches[kind].failures.has(address))).length : 0;
+      const incomplete = committed ? wallets.filter(address => !kinds.every(kind => searches[kind].failures.has(address)) && kinds.some(kind => searches[kind].failures.has(address) || searches[kind].warnings.has(address))).length : 0;
+      searchMessage(`${cancelled ? "Search cancelled. " : ""}${checked} of ${wallets.length} wallet${wallets.length === 1 ? "" : "s"} checked · ${failed} failed${incomplete ? ` · ${incomplete} incomplete` : ""}.${cancelled ? " Retrieved holdings are kept." : ""}`, cancelled || failed || incomplete ? "warning" : "success");
+    }
+    if (restoreFocus) $("searchBtn").focus();
+  }
+}
+
+const accountQueries = new WeakMap();
+async function getWalletAccounts(connection, owner, filters, signal) {
+  let cache = accountQueries.get(connection);
+  if (!cache) { cache = new Map(); accountQueries.set(connection, cache); }
+  const key = `${owner}:${filters.join(",")}`;
+  if (cache.has(key)) return cache.get(key);
+  const query = (async () => {
+    const accounts = [], warnings = [];
+    const queries = filters.length ? filters.map(mint => ({ mint: new solanaWeb3.PublicKey(mint) })) : TOKEN_PROGRAMS.map(programId => ({ programId: new solanaWeb3.PublicKey(programId) }));
+    let successfulQueries = 0;
+    for (const filter of queries) {
+      try {
+        const result = await withAbort(connection.getParsedTokenAccountsByOwner(owner, filter), signal);
+        accounts.push(...result.value); successfulQueries++;
+      } catch (error) {
+        if (error.name === "AbortError") throw error;
+        warnings.push("Some token accounts could not be retrieved.");
+      }
+    }
+    return { accounts, warnings, successfulQueries };
+  })();
+  cache.set(key, query);
+  return query;
+}
+
+async function loadTokenWallet(connection, walletAddress, filters, signal, onProgress = () => {}) {
+  const owner = new solanaWeb3.PublicKey(walletAddress);
+  const entries = [];
+  const warnings = [];
+  if (!filters.length || filters.includes(SOL_MINT)) {
+    try {
+      const balance = await withAbort(connection.getBalance(owner), signal);
+      if (balance > 0) entries.push({ walletAddress, tokenAddress: SOL_MINT, tokenName: "Solana", symbol: "SOL", balance: String(balance), decimals: 9, isNativeSol: true });
+    } catch (error) { if (error.name === "AbortError") throw error; warnings.push("SOL balance unavailable."); }
+  }
+  const balances = new Map();
+  const snapshot = await getWalletAccounts(connection, owner, filters, signal);
+  warnings.push(...snapshot.warnings);
+  for (const account of snapshot.accounts) {
+    try {
+      const info = account.account.data.parsed.info;
+      const amount = info.tokenAmount;
+      if (!/^\d+$/.test(amount.amount) || !Number.isInteger(amount.decimals) || amount.decimals < 0 || amount.decimals > 255) throw new Error("Invalid balance");
+      if (BigInt(amount.amount) === 0n) continue;
+      const previous = balances.get(info.mint);
+      balances.set(info.mint, { balance: (BigInt(previous?.balance || 0) + BigInt(amount.amount)).toString(), decimals: amount.decimals });
+    } catch { warnings.push("Some token balances could not be read."); }
+  }
+  if (!snapshot.successfulQueries && !entries.length) throw new Error("Wallet queries failed");
+  if (TokenService.prefetch) await withAbort(TokenService.prefetch(connection, [...balances.keys()], signal), signal);
+  for (const [mint, amount] of balances) {
+    const metadata = await withAbort(TokenService.getTokenMetadata(connection, mint, signal), signal);
+    if (metadata.isNft) continue;
+    if (metadata.metadataUnavailable) warnings.push("Some asset metadata is unavailable.");
+    entries.push({ walletAddress, tokenAddress: mint, tokenName: metadata.name, symbol: metadata.symbol, ...amount });
+  }
+  onProgress(entries.map(entry => ({ ...entry, usdcValue: null })));
+  for (const entry of entries) {
+    assertActive(signal);
+    entry.usdcValue = entry.tokenAddress === USDC_MINT
+      ? Number(entry.balance) / 10 ** entry.decimals
+      : await getTokenUsdcValue(entry.tokenAddress, entry.balance, signal);
+    if (entry.tokenAddress !== USDC_MINT) await wait(150, signal);
+  }
+  entries.sort((a, b) => Number(Boolean(b.isNativeSol)) - Number(Boolean(a.isNativeSol)) || (b.usdcValue || 0) - (a.usdcValue || 0));
+  return { entries, warning: [...new Set(warnings)].join(" ") };
+}
+
+const quoteCache = new Map();
+async function getTokenUsdcValue(inputMint, amount, signal) {
+  const key = `${inputMint}:${amount}`;
+  const cached = quoteCache.get(key);
+  if (cached && cached.expires > Date.now()) return cached.value;
+  try {
+    assertActive(signal);
+    const params = new URLSearchParams({ inputMint, outputMint: USDC_MINT, amount, slippageBps: 50 });
+    const quote = await Network.json(`https://lite-api.jup.ag/swap/v1/quote?${params}`, {}, { signal, timeout: 5000, retries: 1 });
+    if (quote.inputMint !== inputMint || quote.outputMint !== USDC_MINT || quote.inAmount !== amount || !/^\d+$/.test(quote.outAmount)) return null;
+    const value = Number(quote.outAmount) / 1e6;
+    if (!Number.isFinite(value)) return null;
+    if (quoteCache.size > 2000) quoteCache.clear();
+    quoteCache.set(key, { value, expires: Date.now() + 15000 });
+    return value;
+  } catch { assertActive(signal); return null; }
+}
+
+async function loadNftWallet(connection, walletAddress, filters, signal) {
+  const snapshot = await getWalletAccounts(connection, new solanaWeb3.PublicKey(walletAddress), [], signal);
+  if (!snapshot.successfulQueries) throw new Error("NFT account lookup failed");
+  const entries = [], seen = new Set(), warnings = [...snapshot.warnings];
+  const candidates = snapshot.accounts.flatMap(account => {
+    const info = account.account?.data?.parsed?.info;
+    return info?.tokenAmount?.decimals === 0 ? [info.mint] : [];
+  });
+  if (TokenService.prefetch) await withAbort(TokenService.prefetch(connection, candidates, signal), signal);
+  for (const account of snapshot.accounts) {
+    assertActive(signal);
+    try {
+      const info = account.account.data.parsed.info;
+      if (info.tokenAmount.decimals !== 0 || BigInt(info.tokenAmount.amount) === 0n || seen.has(info.mint)) continue;
+      seen.add(info.mint);
+      const metadata = await withAbort(TokenService.getTokenMetadata(connection, info.mint, signal), signal);
+      if (metadata.metadataUnavailable) { warnings.push("Some NFT metadata could not be read."); continue; }
+      if (!metadata.isNft) continue;
+      const collection = metadata.collection;
+      // Collection filters match verified membership, not a claimed collection address.
+      if (filters.length && (!collection?.verified || !filters.includes(collection.address))) continue;
+      const collectionName = await withAbort(NFTService.getCollectionName(connection, collection, signal), signal);
+      entries.push({ walletAddress, nftAddress: info.mint, nftName: metadata.name || "Unnamed NFT", collectionAddress: collection?.address || "", collectionName, collectionVerified: Boolean(collection?.verified) });
+    } catch (error) { if (error.name === "AbortError") throw error; warnings.push("Some NFT records could not be read."); }
+  }
+  entries.sort((a, b) => a.collectionName.localeCompare(b.collectionName) || a.nftName.localeCompare(b.nftName));
+  return { entries, warning: [...new Set(warnings)].join(" ") };
+}
+
+function formatTokenBalance(balance, decimals = 9) {
+  // Format raw integer amounts without losing precision or treating 0 decimals as 9.
+  const digits = BigInt(balance).toString().padStart(decimals + 1, "0");
+  const integer = decimals ? digits.slice(0, -decimals) : digits;
+  const fraction = decimals ? digits.slice(-decimals).replace(/0+$/, "") : "";
+  return integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + (fraction ? `.${fraction}` : "");
+}
+function abbreviateAddress(address) { return address.length > 16 ? `${address.slice(0, 6)}…${address.slice(-6)}` : address; }
+function formatValue(value) { return value == null ? "Price unavailable" : value > 0 && value < .01 ? "<0.01 USDC" : `${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDC`; }
+function node(tag, className = "", text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text != null) element.textContent = text;
+  return element;
+}
+function addressButton(address, label) {
+  const button = node("button", "address address-copy", abbreviateAddress(address));
+  button.type = "button"; button.title = address; button.dataset.focusKey = `copy:${address}`;
+  button.setAttribute("aria-label", `Copy ${label}: ${address}`);
+  button.addEventListener("click", () => copyToClipboard(address, `${label} copied`));
+  return button;
+}
+function explorerLink(address, type = "token") {
+  const link = node("a", "icon-button");
+  link.href = `https://solscan.io/${type}/${encodeURIComponent(address)}`;
+  link.target = "_blank"; link.rel = "noopener noreferrer"; link.dataset.focusKey = `view:${type}:${address}`;
+  link.setAttribute("aria-label", "View on Solscan (opens in a new tab)"); link.title = "View on Solscan";
+  link.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M10 5H5v14h14v-5"/></svg>';
+  return link;
+}
+function appendCell(row, content, className = "") {
+  const cell = node("td", className);
+  if (typeof content === "string") cell.textContent = content;
+  else cell.append(content);
+  row.append(cell);
+}
+function createTable(kind, entries, includeWallet, key) {
+  const scroll = node("div", "table-scroll");
+  scroll.dataset.scrollKey = key;
+  scroll.tabIndex = 0;
+  scroll.setAttribute("role", "region");
+  scroll.setAttribute("aria-label", `${kind === "tokens" ? "Token" : "NFT"} holdings${includeWallet ? " for all wallets" : ` for ${key}`}. Scroll horizontally for more columns.`);
+  const table = node("table", "results-table");
+  const caption = node("caption", "sr-only", `${kind === "tokens" ? "Token" : "NFT"} holdings${includeWallet ? " across wallets" : ` for ${key}`}`);
+  const head = node("thead"), header = node("tr");
+  const columns = [...(includeWallet ? ["Wallet"] : []), ...(kind === "tokens" ? ["Asset", "Mint address", "Balance", "Est. value (USDC)", "Explore"] : ["NFT", "Collection", "NFT address", "Explore"])];
+  columns.forEach((name) => { const cell = node("th", name === "Balance" || name === "Est. value (USDC)" ? "numeric" : "", name); cell.scope = "col"; header.append(cell); });
+  head.append(header);
+  const body = node("tbody");
+  entries.forEach((entry) => {
+    const row = node("tr");
+    if (includeWallet) appendCell(row, addressButton(entry.walletAddress, "wallet address"));
+    const asset = node("div");
+    asset.append(node("strong", "", kind === "tokens" ? entry.symbol || "Unknown" : entry.nftName));
+    if (kind === "tokens") {
+      asset.append(node("small", "", entry.tokenName || "Unknown token"));
+      appendCell(row, asset, "asset-name");
+      appendCell(row, addressButton(entry.tokenAddress, "token address"));
+      appendCell(row, formatTokenBalance(entry.balance, entry.decimals), "numeric");
+      appendCell(row, entry.usdcValue == null ? "Price unavailable" : formatValue(entry.usdcValue).replace(" USDC", ""), "numeric");
+    } else {
+      appendCell(row, asset, "asset-name");
+      const collection = node("div", "asset-name");
+      collection.append(node("strong", "", entry.collectionName));
+      if (entry.collectionAddress) collection.append(addressButton(entry.collectionAddress, "collection address"));
+      if (entry.collectionAddress && entry.collectionVerified === false) collection.append(node("small", "", "Unverified collection"));
+      appendCell(row, collection);
+      appendCell(row, addressButton(entry.nftAddress, "NFT address"));
+    }
+    appendCell(row, explorerLink(kind === "tokens" ? entry.tokenAddress : entry.nftAddress), "actions-cell");
+    body.append(row);
+  });
+  table.append(caption, head, body);
+  scroll.append(table);
+  const block = node("div", "table-block");
+  block.append(node("p", "table-hint", "Scroll sideways to see all columns →"), scroll);
+  return block;
+}
+
+function assetLabel(kind, count) { return kind === "tokens" ? `token balance${count === 1 ? "" : "s"}` : `NFT${count === 1 ? "" : "s"}`; }
+
+function renderResults(kind) {
+  const search = searches[kind], container = $(`${kind}-result-container`);
+  if (!search.hasSearched) { $(`${kind}-result`).hidden = true; $(`${kind}-more`).hidden = true; container.replaceChildren(); return; }
+  $(`${kind}-result`).hidden = false;
+  const entries = kind === "tokens" ? visibleTokens(search.results) : search.results;
+  const limit = search.limit || PAGE_SIZE;
+  const byWallet = new Map(search.checked.map(address => [address, []]));
+  const scores = new Map();
+  for (const entry of entries) {
+    if (!byWallet.has(entry.walletAddress)) byWallet.set(entry.walletAddress, []);
+    byWallet.get(entry.walletAddress).push(entry);
+    scores.set(entry.walletAddress, (scores.get(entry.walletAddress) || 0) + (kind === "tokens" ? entry.usdcValue || 0 : 1));
+  }
+  const groups = [...byWallet.keys()].sort((a, b) => (scores.get(b) || 0) - (scores.get(a) || 0));
+  let remaining = limit, renderedCount = 0;
+  const grouped = $(kind === "tokens" ? "groupByWalletTokens" : "groupByWalletNFTs").checked;
+  const positions = new Map([...container.querySelectorAll(".table-scroll")].map(el => [el.dataset.scrollKey, el.scrollLeft]));
+  const focused = container.contains(document.activeElement) ? document.activeElement.dataset.focusKey : null;
+  container.replaceChildren();
+  const shownGroups = groups.slice(0, limit);
+  const flat = [];
+  for (const address of shownGroups) {
+    const all = byWallet.get(address);
+    const walletEntries = all.slice(0, Math.max(0, remaining));
+    remaining -= walletEntries.length;
+    renderedCount += walletEntries.length;
+    if (!grouped) flat.push(...walletEntries);
+    if (!grouped && !search.failures.has(address) && !search.warnings.has(address)) continue;
+    if (grouped && all.length && !walletEntries.length && !search.failures.has(address) && !search.warnings.has(address)) continue;
+    const section = node("section", "wallet-group");
+    const heading = node("div", "wallet-header");
+    const title = node("div", "wallet-title"); title.append(addressButton(address, "wallet address"), explorerLink(address, "account"));
+    heading.append(title, node("span", "wallet-count", search.failures.has(address) ? "Needs retry" : `${all.length} ${assetLabel(kind, all.length)}`));
+    section.append(heading);
+    if (search.failures.has(address)) section.append(node("p", "inline-note error", search.failures.get(address) + (all.length ? " Previously retrieved holdings are kept below." : "")));
+    if (search.warnings.has(address)) {
+      const message = search.warnings.get(address);
+      section.append(node("p", "inline-note warning", search.running && message.startsWith("Valuation was not completed.") ? "Pricing holdings…" : message));
+    }
+    if (grouped) {
+      if (walletEntries.length) section.append(createTable(kind, walletEntries, false, address));
+      else if (!search.failures.has(address)) section.append(node("p", "inline-note", search.results.some(entry => entry.walletAddress === address) ? "All balances are below 0.01 USDC. Enable small balances to see them." : "No holdings found for this search."));
+    }
+    container.append(section);
+  }
+  if (!grouped && flat.length) container.append(createTable(kind, flat, true, "all"));
+  if (!groups.length || (!grouped && !entries.length)) container.append(node("p", "inline-note", search.running ? "Results appear here as each lookup finishes." : "No holdings to display. Check filters and any failed wallets above."));
+  container.querySelectorAll(".table-scroll").forEach(el => { el.scrollLeft = positions.get(el.dataset.scrollKey) || 0; });
+  if (focused) [...container.querySelectorAll("[data-focus-key]")].find(el => el.dataset.focusKey === focused)?.focus({ preventScroll: true });
+  const more = $(`${kind}-more`);
+  more.hidden = entries.length <= renderedCount && groups.length <= shownGroups.length;
+  more.textContent = `Show next ${PAGE_SIZE}`;
+  $(`${kind}-summary`).textContent = `${renderedCount}${renderedCount < entries.length ? ` of ${entries.length}` : ""} ${assetLabel(kind, entries.length)} shown${entries.length !== search.results.length ? ` · ${search.results.length - entries.length} small balances hidden` : ""} · ${search.checked.length} wallet${search.checked.length === 1 ? "" : "s"} checked${search.updatedAt ? ` · ${search.updatedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}`;
+  $(kind === "tokens" ? "downloadTokensBtn" : "downloadNftsBtn").disabled = !search.checked.length && !search.results.length;
+  if (kind === "tokens") {
+    const known = entries.reduce((sum, entry) => sum + (entry.usdcValue || 0), 0);
+    const unpriced = entries.filter(entry => entry.usdcValue == null).length;
+    $("tokens-value").textContent = `Priced assets: ${formatValue(known)}${unpriced ? ` · ${unpriced} without ${unpriced === 1 ? "a price" : "prices"}` : ""}`;
+    $("tokens-value").title = "Estimated Jupiter swap quotes in USDC. Only priced, visible assets contribute to this total.";
+  }
+}
+
+function escapeCSV(value) {
+  let text = String(value ?? "");
+  // Quoting alone does not stop spreadsheets from evaluating untrusted metadata as formulas.
+  if (/^[\s\u0000-\u001f]*[=+@-]/.test(text)) text = "'" + text;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+function createCSV(kind) {
+  const search = searches[kind];
+  const entries = kind === "tokens" ? visibleTokens(search.results) : search.results;
+  const base = kind === "tokens" ? ["Wallet Address", "Symbol", "Token Name", "Token Address", "Balance", "USDC Value"] : ["Wallet Address", "Collection Address", "Collection Name", "NFT Name", "NFT Address", "Verified Collection"];
+  const header = [...base, "Status", "Details", "Retrieved At (UTC)"];
+  const status = address => search.failures.has(address) ? "FAILED" : search.warnings.has(address) ? "PARTIAL" : "COMPLETE";
+  const details = address => [search.failures.get(address), search.warnings.get(address)].filter(Boolean).join(" ");
+  const rows = entries.map(entry => {
+    const columns = kind === "tokens"
+      ? [entry.walletAddress, entry.symbol, entry.tokenName, entry.tokenAddress, formatTokenBalance(entry.balance, entry.decimals).replace(/,/g, ""), entry.usdcValue == null ? "" : entry.usdcValue.toFixed(6)]
+      : [entry.walletAddress, entry.collectionAddress, entry.collectionName, entry.nftName, entry.nftAddress, entry.collectionAddress ? String(entry.collectionVerified) : ""];
+    return [...columns, search.failures.has(entry.walletAddress) ? "PARTIAL" : status(entry.walletAddress), details(entry.walletAddress), entry.retrievedAt || ""];
+  });
+  const represented = new Set(entries.map(entry => entry.walletAddress));
+  for (const address of search.wallets.length ? search.wallets : search.checked) {
+    if (represented.has(address)) continue;
+    const checked = search.checked.includes(address);
+    const rowStatus = !checked ? "NOT_CHECKED" : search.failures.has(address) ? "FAILED" : search.warnings.has(address) ? "PARTIAL" : search.results.some(entry => entry.walletAddress === address) ? "FILTERED" : "EMPTY";
+    rows.push([address, ...Array(base.length - 1).fill(""), rowStatus, details(address), ""]);
+  }
+  return [header, ...rows].map(row => row.map(escapeCSV).join(",")).join("\r\n") + "\r\n";
+}
+function downloadCSV(kind) {
+  const url = URL.createObjectURL(new Blob([createCSV(kind)], { type: "text/csv;charset=utf-8;" }));
+  const link = node("a"); link.href = url; link.download = `solana_${kind}_results.csv`;
+  document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast("CSV exported with the current filters");
+}
+function toast(text) {
+  clearTimeout(toastTimer); $("toast").textContent = text; $("toast").hidden = false;
+  toastTimer = setTimeout(() => { $("toast").hidden = true; }, 3500);
+}
+async function copyToClipboard(text, success) {
+  try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); toast(success); return; } } catch { /* Try the local fallback after a permission denial. */ }
+  const previous = document.activeElement;
+  const field = node("textarea", "sr-only");
+  field.value = text; document.body.append(field);
+  try {
+    field.select();
+    if (!document.execCommand("copy")) throw new Error("Clipboard unavailable");
+    toast(success);
+  } catch { toast(`Could not copy. Full address: ${text}`); }
+  finally { field.remove(); previous?.focus({ preventScroll: true }); }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  loadSettings();
+  loadRememberedWallets();
+  window.addEventListener("storage", syncRememberedWallets);
+  $("rememberWallets").addEventListener("change", changeRememberWallets);
+  $("walletAddresses").addEventListener("input", () => inputError());
+  setupWalletImport();
+  for (const [toggle, group] of [["showAllTokens", "specificTokensGroup"], ["showAllNFTs", "specificNFTsGroup"]]) $(toggle).addEventListener("change", () => { $(group).hidden = $(toggle).checked; });
+  $("displaySmallBalances").addEventListener("change", () => renderResults("tokens"));
+  $("groupByWalletTokens").addEventListener("change", () => renderResults("tokens"));
+  $("groupByWalletNFTs").addEventListener("change", () => renderResults("nfts"));
+  $("includeNFTs").addEventListener("change", () => { $("nft-options").hidden = !$("includeNFTs").checked; });
+  $("searchBtn").addEventListener("click", () => runSearch());
+  $("retrySearchBtn").addEventListener("click", () => runSearch(true));
+  $("cancelSearchBtn").addEventListener("click", () => activeSearch?.controller.abort());
+  $("downloadTokensBtn").addEventListener("click", () => downloadCSV("tokens"));
+  $("downloadNftsBtn").addEventListener("click", () => downloadCSV("nfts"));
+  $("settingsBtn").addEventListener("click", () => openSettings());
+  $("settings-form").addEventListener("submit", saveSettings);
+  for (const id of ["closeSettingsBtn", "cancelSettingsBtn"]) $(id).addEventListener("click", () => $("settings-modal").close());
+  $("settings-modal").addEventListener("close", () => {
+    settingsController?.abort();
+    pendingSearch = false;
+    if (!settingsReturnFocus?.disabled) settingsReturnFocus?.focus();
+  });
+  for (const kind of ["tokens", "nfts"]) $(`${kind}-more`).addEventListener("click", () => { searches[kind].limit += PAGE_SIZE; renderResults(kind); });
+  $("rpcUrl").addEventListener("input", () => { $("rpc-error").hidden = true; $("rpcUrl").removeAttribute("aria-invalid"); });
+});
