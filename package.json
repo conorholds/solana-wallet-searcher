@@ -1,0 +1,22 @@
+{
+  "name": "solana-wallet-searcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.cjs",
+    "test:browser": "node tests/browser-check.cjs",
+    "build:check": "node scripts/build.mjs --check",
+    "test:live": "node scripts/smoke-live.mjs"
+  },
+  "dependencies": {
+    "@metaplex-foundation/mpl-token-metadata": "3.4.0",
+    "@metaplex-foundation/umi": "1.6.0",
+    "@solana/addresses": "8.5.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "axe-core": "4.14.0"
+  }
+}
